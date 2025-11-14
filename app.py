@@ -3,21 +3,19 @@ from flask import Flask, request, jsonify
 import time
 import threading
 import requests
+import os
 
 app = Flask(__name__)
 
 # -------------------------
 # CONFIG — fill these
 # -------------------------
-ZOHO_INCOMING_URL = "https://cliq.zoho.in/api/v2/bots/pomodorobot/incoming"
-# Put your access token (from OAuth) here:
-ZOHO_OAUTH_TOKEN = "Zoho-oauthtoken 1000.b37958289e1cfebc703d9daf6da3636f.945433967127b72ef8e8afa3253957d3"
+ZOHO_INCOMING_URL = os.getenv("ZOHO_INCOMING_URL")
+ZOHO_OAUTH_TOKEN = os.getenv("ZOHO_OAUTH_TOKEN")
 
-
-# Optional: to refresh the token automatically (recommended)
-CLIENT_ID = "1000.TCKC5CU1PU6HCSA9RWEZ7TY2KCCBIG"
-CLIENT_SECRET = "b45c9fe991ea183727373b1711c0fd2be15f59ee48"
-REFRESH_TOKEN = "1000.d475bc26df5f9e89c8236368aa6d232d.485f2b1ec139400130feb9aa549c48ec"
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+REFRESH_TOKEN = os.getenv("REFRESH_TOKEN")
  # set if you want auto-refresh
 
 # Defaults
