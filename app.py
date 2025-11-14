@@ -12,7 +12,8 @@ POMODORO_MINUTES = 25
 BREAK_MINUTES = 5
 
 # Your Zoho bot incoming webhook URL (PUT YOUR URL HERE)
-WEBHOOK_URL = "https://cliq.zoho.in/api/v2/bots/pomodorobot/incoming"
+ZOHO_INCOMING_URL = "https://cliq.zoho.in/api/v2/bots/pomodorobot/incoming"
+
 
 # Store user sessions
 sessions = {}
@@ -32,7 +33,7 @@ def timer_watcher():
                     sessions[user].pop("break")
 
                     message = "🟢 **Break finished!**\nType **start** to begin next Pomodoro."
-                    requests.post(WEBHOOK_URL, json={"text": message, "user_id": user})
+                    requests.post(ZOHO_INCOMING_URL, json={"text": message})
 
                     # resume work
                     session["paused"] = False
@@ -45,7 +46,7 @@ def timer_watcher():
                     sessions.pop(user, None)
 
                     message = "⏰ **Pomodoro completed!**\nType **break** to start your 5 min break."
-                    requests.post(WEBHOOK_URL, json={"text": message, "user_id": user})
+                    requests.post(ZOHO_INCOMING_URL, json={"text": message})
 
         time.sleep(1)  # check every second
 
