@@ -12,7 +12,7 @@ POMODORO_MINUTES = 25
 BREAK_MINUTES = 5
 
 # Your Zoho bot incoming webhook URL (PUT YOUR URL HERE)
-WEBHOOK_URL = "https://cliq.zoho.com/api/v2/bots/PomodoroBot/incomingWebhook/1001.e8c507532898a60c41eeca07375121d1.9727a682c18f09ada1bc1fd9fe7c1b85"
+WEBHOOK_URL = "https://cliq.zoho.in/api/v2/bots/pomodorobot/incoming"
 
 # Store user sessions
 sessions = {}
