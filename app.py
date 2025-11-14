@@ -1,14 +1,62 @@
 from flask import Flask, request, jsonify
+import threading
 import time
+import requests
 
 app = Flask(__name__)
 
-sessions = {}
-
+# ================================
+# SETTINGS
+# ================================
 POMODORO_MINUTES = 25
 BREAK_MINUTES = 5
 
+# Your Zoho bot incoming webhook URL (PUT YOUR URL HERE)
+WEBHOOK_URL = "https://cliq.zoho.com/api/v2/bots/PomodoroBot/incomingWebhook/1001.e8c507532898a60c41eeca07375121d1.9727a682c18f09ada1bc1fd9fe7c1b85"
 
+# Store user sessions
+sessions = {}
+
+# ================================
+# BACKGROUND CHECKER FOR AUTO NOTIFS
+# ================================
+def timer_watcher():
+    while True:
+        now = time.time()
+
+        for user, session in list(sessions.items()):
+            # Break session check
+            if "break" in session:
+                elapsed = now - session["break"]["start"]
+                if elapsed >= session["break"]["duration"]:
+                    sessions[user].pop("break")
+
+                    message = "🟢 **Break finished!**\nType **start** to begin next Pomodoro."
+                    requests.post(WEBHOOK_URL, json={"text": message, "user_id": user})
+
+                    # resume work
+                    session["paused"] = False
+                    session["start"] = now
+
+            else:
+                # Work session check
+                elapsed = now - session["start"]
+                if elapsed >= session["remaining"]:
+                    sessions.pop(user, None)
+
+                    message = "⏰ **Pomodoro completed!**\nType **break** to start your 5 min break."
+                    requests.post(WEBHOOK_URL, json={"text": message, "user_id": user})
+
+        time.sleep(1)  # check every second
+
+
+# Run background thread
+thread = threading.Thread(target=timer_watcher, daemon=True)
+thread.start()
+
+# ================================
+# MAIN API ENDPOINT
+# ================================
 @app.route("/pomodoro", methods=["POST"])
 def pomodoro():
     data = request.json
@@ -24,67 +72,52 @@ def pomodoro():
             "remaining": POMODORO_MINUTES * 60,
             "paused": False
         }
-        return jsonify({"reply": f"🍅 Pomodoro started for {POMODORO_MINUTES} minutes!"})
+        return jsonify({"reply": "🍅 Pomodoro started for 25 minutes!"})
 
-    # START BREAK WHILE WORK IS RUNNING
+    # START BREAK (pause Pomodoro)
     if msg == "break":
         if user not in sessions or sessions[user]["type"] != "work":
-            return jsonify({"reply": "❌ No active Pomodoro to pause. Start with: start"})
+            return jsonify({"reply": "❌ No Pomodoro to pause. Type 'start' first."})
 
-        # PAUSE WORK SESSION
         elapsed = time.time() - sessions[user]["start"]
         sessions[user]["remaining"] -= elapsed
         sessions[user]["paused"] = True
 
-        # START BREAK SESSION
         sessions[user]["break"] = {
             "start": time.time(),
             "duration": BREAK_MINUTES * 60
         }
 
-        return jsonify({"reply": f"☕ Break started for {BREAK_MINUTES} minutes!"})
+        return jsonify({"reply": "☕ Break started for 5 minutes!"})
 
     # STOP SESSION
     if msg == "stop":
-
-        # If currently on break → end break and resume work
         if user in sessions and "break" in sessions[user]:
-            break_data = sessions[user].pop("break")
-            remaining = int(sessions[user]["remaining"] // 60)
+            sessions[user].pop("break")
+            mins = int(sessions[user]["remaining"] // 60)
             secs = int(sessions[user]["remaining"] % 60)
-            return jsonify({
-                "reply": f"☕ Break stopped. 🍅 Pomodoro resumed. Remaining: {remaining}m {secs}s"
-            })
+            return jsonify({"reply": f"☕ Break stopped. 🍅 Pomodoro resumed with {mins}m {secs}s left."})
 
-        # If stopping full pomodoro
         sessions.pop(user, None)
         return jsonify({"reply": "⏹️ Pomodoro ended."})
 
-    # STATUS CHECK
+    # STATUS
     if msg == "status":
-
         if user not in sessions:
-            return jsonify({"reply": "❌ No active session. Use: start"})
+            return jsonify({"reply": "❌ No session active."})
 
         session = sessions[user]
 
-        # If break ongoing
+        # If break active
         if "break" in session:
             elapsed = time.time() - session["break"]["start"]
             remaining = session["break"]["duration"] - elapsed
-
             if remaining <= 0:
-                # End break, resume work
-                session.pop("break")
-                session["paused"] = False
-                session["start"] = time.time()
                 return jsonify({"reply": "🟢 Break finished. Pomodoro resumed!"})
 
-            mins = int(remaining // 60)
-            secs = int(remaining % 60)
-            return jsonify({"reply": f"☕ Break left: {mins}m {secs}s"})
+            return jsonify({"reply": f"☕ Break left: {int(remaining//60)}m {int(remaining%60)}s"})
 
-        # Work session (active or resumed)
+        # Work active
         if not session["paused"]:
             elapsed = time.time() - session["start"]
             remaining = session["remaining"] - elapsed
@@ -92,16 +125,15 @@ def pomodoro():
             remaining = session["remaining"]
 
         if remaining <= 0:
-            sessions.pop(user, None)
-            return jsonify({"reply": "✨ Pomodoro session completed!"})
+            return jsonify({"reply": "✨ Pomodoro completed!"})
 
-        mins = int(remaining // 60)
-        secs = int(remaining % 60)
-        return jsonify({"reply": f"🍅 Pomodoro left: {mins}m {secs}s"})
+        return jsonify({"reply": f"🍅 Pomodoro left: {int(remaining//60)}m {int(remaining%60)}s"})
 
-    # Unknown command
-    return jsonify({"reply": "🙂 Commands:\nstart | break | stop | status"})
+    return jsonify({"reply": "🙂 Commands: start | break | stop | status"})
 
 
+# ================================
+# MAIN
+# ================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
