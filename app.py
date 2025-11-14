@@ -64,15 +64,31 @@ def pomodoro():
     user = str(data.get("user"))
 
     # START WORK SESSION
-    if msg == "start":
+       # START WORK SESSION (custom or default)
+    if msg.startswith("start"):
+
+        parts = msg.split()
+
+        # custom minutes
+        if len(parts) == 2 and parts[1].isdigit():
+            custom_minutes = int(parts[1])
+            duration_seconds = custom_minutes * 60
+            duration_text = f"{custom_minutes} minutes"
+        else:
+            # default 25 min
+            custom_minutes = 25
+            duration_seconds = POMODORO_MINUTES * 60
+            duration_text = "25 minutes"
+
         sessions[user] = {
             "type": "work",
             "start": time.time(),
-            "duration": POMODORO_MINUTES * 60,
-            "remaining": POMODORO_MINUTES * 60,
+            "duration": duration_seconds,
+            "remaining": duration_seconds,
             "paused": False
         }
-        return jsonify({"reply": "🍅 Pomodoro started for 25 minutes!"})
+
+        return jsonify({"reply": f"🍅 Pomodoro started for {duration_text}!"})
 
     # START BREAK (pause Pomodoro)
     if msg == "break":
