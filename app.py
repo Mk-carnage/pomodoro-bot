@@ -1,272 +1,200 @@
-# app.py
-from flask import Flask, request, jsonify
-import time
-import threading
-import requests
 import os
+import threading
+import time
+from datetime import datetime, timedelta
 
-app = Flask(__name__)
+from flask import Flask, request, jsonify
+import requests
 
-# -------------------------
-# CONFIG — fill these
-# -------------------------
+# -----------------------------
+# Load Environment Variables
+# -----------------------------
 ZOHO_INCOMING_URL = os.getenv("ZOHO_INCOMING_URL")
 ZOHO_OAUTH_TOKEN = os.getenv("ZOHO_OAUTH_TOKEN")
 
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 REFRESH_TOKEN = os.getenv("REFRESH_TOKEN")
- # set if you want auto-refresh
 
-# Defaults
-DEFAULT_POMODORO_MIN = 25
-DEFAULT_BREAK_MIN = 5
+app = Flask(__name__)
 
-# -------------------------
-# In-memory session store
-# sessions structure per user_id:
-# {
-#   "type": "work",
-#   "start": timestamp,
-#   "duration": seconds,
-#   "remaining": seconds,
-#   "paused": False,
-#   "break": { "start": timestamp, "duration": seconds }  # optional
-# }
-# -------------------------
-sessions = {}
-sessions_lock = threading.Lock()
+# -----------------------------
+# GLOBAL STORAGE (RAM)
+# -----------------------------
+timers = {}  # per-user timers
 
-# Headers helper
-def zoho_headers():
-    return {"Authorization": ZOHO_OAUTH_TOKEN, "Content-Type": "application/json"}
 
-# -------------------------
-# Notify function (sends to Zoho incoming webhook)
-# retries once if token expired and refresh available
-# -------------------------
-def notify_user(message):
-    try:
-        r = requests.post(ZOHO_INCOMING_URL, json={"text": message}, headers=zoho_headers(), timeout=10)
-        if r.status_code == 401 and CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN:
-            # try refreshing token once
-            print("Zoho returned 401 — attempting token refresh...")
-            if refresh_access_token():
-                r = requests.post(ZOHO_INCOMING_URL, json={"text": message}, headers=zoho_headers(), timeout=10)
-        print("Notify -> status:", r.status_code, r.text if r is not None else "no response")
-        return r
-    except Exception as e:
-        print("Error sending notify:", e)
-        return None
-
-# -------------------------
-# Token refresh (if you configured refresh token)
-# -------------------------
+# -----------------------------
+# Helper: Refresh Token if Needed
+# -----------------------------
 def refresh_access_token():
     global ZOHO_OAUTH_TOKEN
-    if not (CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN):
-        return False
+
     url = "https://accounts.zoho.in/oauth/v2/token"
-    data = {
+    params = {
         "refresh_token": REFRESH_TOKEN,
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
-        "grant_type": "refresh_token"
+        "grant_type": "refresh_token",
     }
-    try:
-        r = requests.post(url, data=data, timeout=10)
-        if r.status_code == 200:
-            j = r.json()
-            access = j.get("access_token")
-            if access:
-                ZOHO_OAUTH_TOKEN = f"Zoho-oauthtoken {access}"
-                print("Access token refreshed successfully.")
-                return True
-        print("Failed to refresh token:", r.status_code, r.text)
-    except Exception as e:
-        print("Exception refreshing token:", e)
-    return False
 
-# -------------------------
-# Background watcher
-# -------------------------
+    response = requests.post(url, params=params)
+    data = response.json()
+
+    if "access_token" in data:
+        print("🔄 Access token refreshed!")
+        ZOHO_OAUTH_TOKEN = "Zoho-oauthtoken " + data["access_token"]
+    else:
+        print("❌ Failed to refresh token:", data)
+
+
+# -----------------------------
+# Helper: Send message to Zoho
+# -----------------------------
+def send_message(bot_user, text):
+    headers = {
+        "Authorization": ZOHO_OAUTH_TOKEN,
+        "Content-Type": "application/json",
+    }
+
+    payload = {"text": text}
+
+    r = requests.post(ZOHO_INCOMING_URL, json=payload, headers=headers)
+
+    if r.status_code == 401:
+        print("⚠ 401 Unauthorized — refreshing token")
+        refresh_access_token()
+        r = requests.post(ZOHO_INCOMING_URL, json=payload, headers=headers)
+
+    print("📤 Sent to Zoho:", r.text)
+    return r.text
+
+
+# -----------------------------
+# Parse Start Command
+# -----------------------------
+def parse_start_command(message):
+    parts = message.split()
+
+    duration = 25
+    task_name = "Untitled Task"
+
+    # Case 1: "start 20 Write report"
+    if len(parts) >= 3 and parts[1].isdigit():
+        duration = int(parts[1])
+        task_name = " ".join(parts[2:]).strip()
+
+    # Case 2: "start Write report"
+    elif len(parts) >= 2:
+        task_name = " ".join(parts[1:]).strip()
+
+    return duration, task_name
+
+
+# -----------------------------
+# Background Timer Watcher
+# -----------------------------
 def timer_watcher():
-    print("Timer watcher thread started.")
+    print("⏳ Background timer watcher started...")
+
     while True:
-        now = time.time()
-        with sessions_lock:
-            for user_id in list(sessions.keys()):
-                session = sessions.get(user_id)
-                if not session:
-                    continue
+        now = datetime.utcnow()
 
-                # If break running
-                if "break" in session:
-                    b = session["break"]
-                    elapsed = now - b["start"]
-                    if elapsed >= b["duration"]:
-                        # end break, resume work
-                        session.pop("break", None)
-                        session["paused"] = False
-                        session["start"] = now
-                        try:
-                            notify_user(f"🟢 Break finished! Type `start` to begin next Pomodoro.")
-                        except Exception as e:
-                            print("Notify exception on break end:", e)
-                    # else continue to next user
-                    continue
+        finished_users = []
 
-                # Work session check (active or paused)
-                if not session.get("paused", False):
-                    elapsed = now - session["start"]
-                    remaining = session["remaining"] - elapsed
-                else:
-                    remaining = session["remaining"]
+        for user_id, info in timers.items():
+            if now >= info["end"]:
+                finished_users.append(user_id)
 
-                if remaining <= 0:
-                    # session finished
-                    sessions.pop(user_id, None)
-                    try:
-                        notify_user("⏰ Pomodoro completed! Type `break` to start your 5 min break.")
-                    except Exception as e:
-                        print("Notify exception on pomodoro end:", e)
+        # Process completed timers
+        for user in finished_users:
+            task = timers[user]["task"]
+            send_message(user, f"⏰ Pomodoro completed!\n✔ Finished: **{task}**\nType `break` to start your rest.")
+            del timers[user]
 
-        time.sleep(1)  # check every second
+        time.sleep(1)
 
-# start watcher in a way that works with gunicorn / other servers:
+
+# -----------------------------
+# Start watcher only once
+# (Flask 3 compatible)
+# -----------------------------
 @app.before_request
 def start_background_thread():
     if not getattr(app, "watcher_thread_started", False):
         t = threading.Thread(target=timer_watcher, daemon=True)
         t.start()
         app.watcher_thread_started = True
+        print("🚀 Watcher thread started")
 
 
-# -------------------------
-# Helper: create session
-# -------------------------
-def start_pomodoro_for(user_id, minutes):
-    secs = int(minutes * 60)
-    with sessions_lock:
-        sessions[user_id] = {
-            "type": "work",
-            "start": time.time(),
-            "duration": secs,
-            "remaining": secs,
-            "paused": False
+# -----------------------------
+# Main Endpoint for Bot
+# -----------------------------
+@app.route("/pomodoro", methods=["POST"])
+def pomodoro():
+    data = request.json
+    message = data.get("raw", "").lower()
+    user_id = data.get("user")
+
+    if not user_id:
+        return jsonify({"reply": "❌ No user ID"}), 400
+
+    # -----------------------------
+    # START COMMAND
+    # -----------------------------
+    if message.startswith("start"):
+        duration, task_name = parse_start_command(data["raw"])
+
+        end_time = datetime.utcnow() + timedelta(minutes=duration)
+
+        timers[user_id] = {
+            "end": end_time,
+            "task": task_name,
+            "break": False
         }
 
-# -------------------------
-# Flask endpoint for Deluge -> POST { "message": "start 25", "user": "12345" }
-# Responds with JSON: { "reply": "..." }
-# -------------------------
-@app.route("/pomodoro", methods=["POST"])
-def pomodoro_endpoint():
-    data = request.get_json(force=True, silent=True)
-    if not data:
-        return jsonify({"reply": "Invalid request. Send JSON: { message, user }"}), 400
+        return jsonify({"reply": f"🍅 Pomodoro started: **{task_name}** for {duration} minutes!"})
 
-    raw_msg = str(data.get("message", "")).strip()
-    user = str(data.get("user", "unknown"))
+    # -----------------------------
+    # STATUS
+    # -----------------------------
+    if message.startswith("status"):
+        if user_id not in timers:
+            return jsonify({"reply": "❌ No active pomodoro session."})
 
-    msg = raw_msg.lower().strip()
-    reply = "🙂 Commands: start [minutes] | break | stop | status"
+        info = timers[user_id]
+        task = info.get("task", "Unnamed Task")
 
-    try:
-        if msg.startswith("start"):
-            parts = msg.split()
-            if len(parts) == 2 and parts[1].isdigit():
-                minutes = int(parts[1])
-            else:
-                minutes = DEFAULT_POMODORO_MIN
-            start_pomodoro_for(user, minutes)
-            reply = f"🍅 Pomodoro started for {minutes} minutes!"
-            return jsonify({"reply": reply})
+        remaining = info["end"] - datetime.utcnow()
+        seconds = max(int(remaining.total_seconds()), 0)
+        mins = seconds // 60
+        secs = seconds % 60
 
-        if msg == "break":
-            with sessions_lock:
-                if user not in sessions or sessions[user]["type"] != "work":
-                    return jsonify({"reply": "❌ No active Pomodoro to pause. Type `start` first."})
-                # pause work, compute remaining
-                elapsed = time.time() - sessions[user]["start"]
-                sessions[user]["remaining"] -= elapsed
-                sessions[user]["paused"] = True
-                # start break
-                sessions[user]["break"] = {
-                    "start": time.time(),
-                    "duration": DEFAULT_BREAK_MIN * 60
-                }
-            reply = f"☕ Break started for {DEFAULT_BREAK_MIN} minutes!"
-            return jsonify({"reply": reply})
+        return jsonify({"reply": f"🍅 Task: **{task}**\n⏳ Time left: {mins}m {secs}s"})
 
-        if msg == "stop":
-            with sessions_lock:
-                # if break in progress -> stop break and resume work
-                if user in sessions and "break" in sessions[user]:
-                    sessions[user].pop("break", None)
-                    # resume: set start to now (work remaining unchanged)
-                    sessions[user]["start"] = time.time()
-                    sessions[user]["paused"] = False
-                    rem = int(sessions[user]["remaining"])
-                    m = rem // 60
-                    s = rem % 60
-                    return jsonify({"reply": f"☕ Break stopped. 🍅 Pomodoro resumed. Remaining: {m}m {s}s"})
-                # else stop whole session
-                sessions.pop(user, None)
-            return jsonify({"reply": "⏹️ Pomodoro ended."})
+    # -----------------------------
+    # STOP TIMER
+    # -----------------------------
+    if message.startswith("stop"):
+        if user_id in timers:
+            del timers[user_id]
+            return jsonify({"reply": "🛑 Pomodoro stopped."})
+        return jsonify({"reply": "❌ No active session to stop."})
 
-        if msg == "status":
-            with sessions_lock:
-                if user not in sessions:
-                    return jsonify({"reply": "❌ No active session. Use: start"})
-                session = sessions[user]
+    return jsonify({"reply": "🤖 Unknown command"})
 
-                # if break ongoing
-                if "break" in session:
-                    elapsed = time.time() - session["break"]["start"]
-                    remaining = session["break"]["duration"] - elapsed
-                    if remaining <= 0:
-                        # break finished, resume
-                        session.pop("break", None)
-                        session["paused"] = False
-                        session["start"] = time.time()
-                        return jsonify({"reply": "🟢 Break finished. Pomodoro resumed!"})
-                    mins = int(remaining // 60)
-                    secs = int(remaining % 60)
-                    return jsonify({"reply": f"☕ Break left: {mins}m {secs}s"})
 
-                # work session
-                if not session.get("paused", False):
-                    elapsed = time.time() - session["start"]
-                    remaining = session["remaining"] - elapsed
-                else:
-                    remaining = session["remaining"]
+# -----------------------------
+# Root (optional)
+# -----------------------------
+@app.route("/")
+def home():
+    return "Pomodoro Bot Running."
 
-                if remaining <= 0:
-                    sessions.pop(user, None)
-                    return jsonify({"reply": "✨ Pomodoro completed!"})
 
-                mins = int(remaining // 60)
-                secs = int(remaining % 60)
-                return jsonify({"reply": f"🍅 Pomodoro left: {mins}m {secs}s"})
-
-        # fallback
-        return jsonify({"reply": reply})
-    except Exception as e:
-        print("Exception in /pomodoro:", e)
-        return jsonify({"reply": "Internal server error"}), 500
-
-# -------------------------
-# Optional health check endpoint
-# -------------------------
-@app.route("/health", methods=["GET"])
-def health():
-    return "OK", 200
-
-# -------------------------
-# Run
-# -------------------------
+# -----------------------------
+# Run Server
+# -----------------------------
 if __name__ == "__main__":
-    # If you run directly (python app.py) the watcher will start before_first_request as well.
-    print("Starting Flask (dev) server...")
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
