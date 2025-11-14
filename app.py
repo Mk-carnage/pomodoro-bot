@@ -134,13 +134,13 @@ def timer_watcher():
         time.sleep(1)  # check every second
 
 # start watcher in a way that works with gunicorn / other servers:
-@app.before_first_request
+@app.before_request
 def start_background_thread():
-    if not hasattr(app, "watcher_thread_started"):
+    if not getattr(app, "watcher_thread_started", False):
         t = threading.Thread(target=timer_watcher, daemon=True)
         t.start()
         app.watcher_thread_started = True
-        print("Background watcher scheduled (before_first_request).")
+
 
 # -------------------------
 # Helper: create session
