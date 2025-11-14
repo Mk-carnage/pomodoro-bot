@@ -1,3 +1,4 @@
+# app.py
 import os
 import threading
 import time
@@ -8,9 +9,9 @@ from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify
 import requests
 
-# -----------------------------
+# ==========================================
 # ENVIRONMENT VARIABLES
-# -----------------------------
+# ==========================================
 ZOHO_INCOMING_URL = os.getenv("ZOHO_INCOMING_URL")
 ZOHO_OAUTH_TOKEN = os.getenv("ZOHO_OAUTH_TOKEN")
 
@@ -18,33 +19,28 @@ CLIENT_ID = os.getenv("CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")
 REFRESH_TOKEN = os.getenv("REFRESH_TOKEN", "")
 
-# Summary times - India Work Hours (modifiable)
+# Summary times (Indian work hours)
 MORNING_HOUR = 9
 EVENING_HOUR = 17
 
-# Optional test mode
-TEST_MODE = os.getenv("TEST_MODE", "0") == "1"
-
-# Timezone
 LOCAL_TZ = ZoneInfo("Asia/Kolkata")
 
-# Files
+# Data files
 HISTORY_FILE = "history.json"
 SUMMARY_STATE_FILE = "summary_state.json"
 STREAK_FILE = "streaks.json"
+SCORE_FILE = "scores.json"
 
 app = Flask(__name__)
 
-# -----------------------------
-# TIMER STORAGE
-# -----------------------------
+# Timer storage
 timers = {}
 timers_lock = threading.Lock()
 
 
-# -----------------------------
+# ==========================================
 # FILE HELPERS
-# -----------------------------
+# ==========================================
 def load_file(path, default):
     try:
         with open(path, "r") as f:
@@ -58,7 +54,6 @@ def save_file(path, data):
         json.dump(data, f, indent=4)
 
 
-# HISTORY HELPERS
 def load_history():
     return load_file(HISTORY_FILE, [])
 
@@ -67,7 +62,6 @@ def save_history(data):
     save_file(HISTORY_FILE, data)
 
 
-# SUMMARY STATE HELPERS
 def load_summary_state():
     return load_file(SUMMARY_STATE_FILE, {})
 
@@ -76,7 +70,6 @@ def save_summary_state(data):
     save_file(SUMMARY_STATE_FILE, data)
 
 
-# STREAK HELPERS
 def load_streaks():
     return load_file(STREAK_FILE, {})
 
@@ -85,37 +78,36 @@ def save_streaks(data):
     save_file(STREAK_FILE, data)
 
 
-# -----------------------------
-# SEND MESSAGE TO ZOHO
-# -----------------------------
+def load_scores():
+    return load_file(SCORE_FILE, {})
+
+
+def save_scores(data):
+    save_file(SCORE_FILE, data)
+
+
+# ==========================================
+# SEND MESSAGE
+# ==========================================
 def send_message(text):
     headers = {"Authorization": ZOHO_OAUTH_TOKEN, "Content-Type": "application/json"}
     payload = {"text": text}
 
-    try:
+    r = requests.post(ZOHO_INCOMING_URL, json=payload, headers=headers)
+
+    if r.status_code == 401:
+        refresh_access_token()
+        headers["Authorization"] = ZOHO_OAUTH_TOKEN
         r = requests.post(ZOHO_INCOMING_URL, json=payload, headers=headers)
 
-        if r.status_code == 401:
-            refresh_access_token()
-            headers["Authorization"] = ZOHO_OAUTH_TOKEN
-            r = requests.post(ZOHO_INCOMING_URL, json=payload, headers=headers)
-
-        print("Sent:", r.text)
-        return r.text
-
-    except Exception as e:
-        print("Send error:", e)
-        return None
+    return r.text
 
 
-# -----------------------------
+# ==========================================
 # REFRESH TOKEN
-# -----------------------------
+# ==========================================
 def refresh_access_token():
     global ZOHO_OAUTH_TOKEN
-
-    if not (CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN):
-        return
 
     url = "https://accounts.zoho.in/oauth/v2/token"
     params = {
@@ -125,19 +117,17 @@ def refresh_access_token():
         "grant_type": "refresh_token"
     }
 
-    r = requests.post(url, params=params)
-    data = r.json()
+    r = requests.post(url, params=params).json()
 
-    if "access_token" in data:
-        ZOHO_OAUTH_TOKEN = "Zoho-oauthtoken " + data["access_token"]
+    if "access_token" in r:
+        ZOHO_OAUTH_TOKEN = "Zoho-oauthtoken " + r["access_token"]
 
 
-# -----------------------------
+# ==========================================
 # PARSE START COMMAND
-# -----------------------------
+# ==========================================
 def parse_start_command(msg):
     parts = msg.split()
-
     duration = 25
     task = "Untitled Task"
 
@@ -150,57 +140,85 @@ def parse_start_command(msg):
     return duration, task
 
 
-# -----------------------------
-# STREAK UPDATE
-# -----------------------------
+# ==========================================
+# STREAK SYSTEM
+# ==========================================
 def update_streak_for_user(user_id):
     streaks = load_streaks()
 
     today = datetime.utcnow().strftime("%Y-%m-%d")
     yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    user_data = streaks.get(user_id, {
+    user = streaks.get(user_id, {
         "current_streak": 0,
         "longest_streak": 0,
         "last_completed_date": None
     })
 
-    last = user_data["last_completed_date"]
+    last = user["last_completed_date"]
 
     if last == yesterday:
-        user_data["current_streak"] += 1
+        user["current_streak"] += 1
     elif last != today:
-        user_data["current_streak"] = 1
+        user["current_streak"] = 1
 
-    user_data["longest_streak"] = max(
-        user_data["longest_streak"],
-        user_data["current_streak"]
-    )
+    user["longest_streak"] = max(user["longest_streak"], user["current_streak"])
+    user["last_completed_date"] = today
 
-    user_data["last_completed_date"] = today
-
-    streaks[user_id] = user_data
+    streaks[user_id] = user
     save_streaks(streaks)
 
-    return user_data["current_streak"], user_data["longest_streak"]
+    return user["current_streak"], user["longest_streak"]
 
 
-# -----------------------------
-# TIMER WATCHER (Pomodoro complete)
-# -----------------------------
+# ==========================================
+# FOCUS SCORE SYSTEM
+# ==========================================
+def calculate_level(xp):
+    if xp < 100:
+        return 1
+    elif xp < 250:
+        return 2
+    elif xp < 500:
+        return 3
+    elif xp < 1000:
+        return 4
+    return xp // 500 + 4
+
+
+def update_score(user_id, duration, streak):
+    scores = load_scores()
+
+    user = scores.get(user_id, {"xp": 0, "level": 1})
+
+    base_xp = duration
+    streak_bonus = streak * 5
+    long_bonus = 10 if duration >= 30 else 0
+
+    gained = base_xp + streak_bonus + long_bonus
+    user["xp"] += gained
+    user["level"] = calculate_level(user["xp"])
+
+    scores[user_id] = user
+    save_scores(scores)
+
+    return gained, user["xp"], user["level"]
+
+
+# ==========================================
+# TIMER WATCHER
+# ==========================================
 def timer_watcher():
-    print("Timer watcher started…")
-
     while True:
         now = datetime.utcnow()
-        to_finish = []
+        completed = []
 
         with timers_lock:
-            for uid, info in timers.items():
+            for uid, info in list(timers.items()):
                 if now >= info["end"]:
-                    to_finish.append((uid, info))
+                    completed.append((uid, info))
 
-        for uid, info in to_finish:
+        for uid, info in completed:
             task = info["task"]
             duration = info["duration"]
 
@@ -215,16 +233,20 @@ def timer_watcher():
             })
             save_history(history)
 
-            # Update streak
+            # Streak update
             current, longest = update_streak_for_user(uid)
 
-            # Send message
+            # Score update
+            gained, total_xp, level = update_score(uid, duration, current)
+
             send_message(
                 f"⏰ Pomodoro Completed!\n"
                 f"✔ Task: **{task}**\n\n"
-                f"🔥 Current Streak: {current} days\n"
-                f"🏆 Longest Streak: {longest} days\n"
-                f"Type `break` to start resting."
+                f"🔥 Streak: {current} days\n"
+                f"🏆 Longest: {longest} days\n\n"
+                f"🎯 XP Earned: +{gained}\n"
+                f"💠 Total XP: {total_xp}\n"
+                f"⭐ Level: {level}"
             )
 
             with timers_lock:
@@ -233,62 +255,57 @@ def timer_watcher():
         time.sleep(1)
 
 
-# -----------------------------
-# SUMMARY SCHEDULER (9AM + 5PM)
-# -----------------------------
-def build_daily_summary(user):
+# ==========================================
+# SUMMARY SYSTEM (9 AM + 5 PM)
+# ==========================================
+def build_daily_summary(uid):
     history = load_history()
     today = datetime.utcnow().strftime("%Y-%m-%d")
 
-    items = [h for h in history if h["user"] == user and h["date"] == today]
+    tasks = [h for h in history if h["user"] == uid and h["date"] == today]
 
-    if not items:
-        return f"📅 No tasks completed today."
+    if not tasks:
+        return "📅 No tasks completed today."
 
-    total = sum(h["duration"] for h in items)
-    out = f"📅 **Daily Summary**\n\nTotal Pomodoros: {len(items)}\nTotal Focus: {total} min\n\nTasks:\n"
+    total = sum(h["duration"] for h in tasks)
 
-    for h in items:
+    out = f"📅 **Daily Summary**\nTotal Focus: {total} min\n\nTasks:\n"
+    for h in tasks:
         out += f"• {h['task']} — {h['duration']}m\n"
 
     return out
 
 
 def summary_scheduler():
-    print("Summary scheduler started…")
-
     while True:
-        now = datetime.now(LOCAL_TZ)
-        time_str = now.strftime("%H:%M")
+        now = datetime.now(LOCAL_TZ).strftime("%H:%M")
 
-        if time_str in ["09:00", "17:00"]:
+        if now in ["09:00", "17:00"]:
             history = load_history()
-            users = list(set([h["user"] for h in history]))
+            users = list({h["user"] for h in history})
 
-            for user in users:
-                summary = build_daily_summary(user)
-                send_message(summary)
+            for uid in users:
+                send_message(build_daily_summary(uid))
 
             time.sleep(60)
 
         time.sleep(20)
 
 
-# -----------------------------
-# FLASK STARTUP HOOK
-# -----------------------------
+# ==========================================
+# FLASK STARTUP THREADS
+# ==========================================
 @app.before_request
 def start_threads():
     if not getattr(app, "threads_started", False):
         threading.Thread(target=timer_watcher, daemon=True).start()
         threading.Thread(target=summary_scheduler, daemon=True).start()
         app.threads_started = True
-        print("Background threads started.")
 
 
-# -----------------------------
-# BOT COMMANDS
-# -----------------------------
+# ==========================================
+# BOT ENDPOINT
+# ==========================================
 @app.route("/pomodoro", methods=["POST"])
 def pomodoro():
     data = request.json
@@ -302,25 +319,23 @@ def pomodoro():
         with timers_lock:
             timers[user] = {"end": end, "task": task, "duration": duration}
 
-        return jsonify({"reply": f"🍅 Started **{task}** for {duration} minutes."})
+        return jsonify({"reply": f"🍅 Started **{task}** ({duration} min)"})
 
     if msg.startswith("status"):
         with timers_lock:
             if user not in timers:
-                return jsonify({"reply": "❌ No active session."})
-
+                return jsonify({"reply": "❌ No active session"})
             info = timers[user]
             remaining = info["end"] - datetime.utcnow()
-            sec = int(max(remaining.total_seconds(), 0))
-            return jsonify({"reply": f"🍅 {info['task']} — {sec//60}m {sec%60}s left"})
+            sec = max(int(remaining.total_seconds()), 0)
+            return jsonify({"reply": f"{info['task']} — {sec//60}m {sec%60}s left"})
 
     if msg.startswith("stop"):
         with timers_lock:
             if user in timers:
                 timers.pop(user, None)
-                return jsonify({"reply": "🛑 Stopped."})
-
-        return jsonify({"reply": "❌ No session."})
+                return jsonify({"reply": "🛑 Stopped"})
+        return jsonify({"reply": "❌ No session to stop"})
 
     if msg.startswith("today"):
         return jsonify({"reply": build_daily_summary(user)})
@@ -330,45 +345,45 @@ def pomodoro():
         user_hist = [h for h in history if h["user"] == user]
 
         if not user_hist:
-            return jsonify({"reply": "📭 No history."})
+            return jsonify({"reply": "📭 No history"})
 
         summary = {}
         for h in user_hist:
             summary[h["date"]] = summary.get(h["date"], 0) + 1
 
-        out = "📊 **Weekly Summary**\n\n"
+        out = "📊 Weekly Summary\n\n"
         for d, c in summary.items():
-            out += f"{d}: {'🍅' * c} ({c})\n"
+            out += f"{d}: {'🍅'*c} ({c})\n"
 
         return jsonify({"reply": out})
 
     if msg.startswith("streak"):
         streaks = load_streaks()
         s = streaks.get(user)
-
         if not s:
-            return jsonify({"reply": "🔥 No streak yet!"})
+            return jsonify({"reply": "🔥 No streak yet"})
+        return jsonify({"reply": f"🔥 Streak: {s['current_streak']} days\n🏆 Longest: {s['longest_streak']} days"})
 
-        return jsonify({
-            "reply": (
-                f"🔥 Current Streak: {s['current_streak']} days\n"
-                f"🏆 Longest Streak: {s['longest_streak']} days"
-            )
-        })
+    if msg.startswith("score"):
+        scores = load_scores()
+        s = scores.get(user)
+        if not s:
+            return jsonify({"reply": "🎯 No XP yet"})
+        return jsonify({"reply": f"🎯 XP: {s['xp']}\n⭐ Level: {s['level']}"})
 
-    return jsonify({"reply": "🤖 Commands: start | status | stop | today | week | streak"})
+    return jsonify({"reply": "Commands: start | status | stop | today | week | streak | score"})
 
 
-# -----------------------------
+# ==========================================
 # ROOT
-# -----------------------------
+# ==========================================
 @app.route("/")
 def home():
     return "Pomodoro Bot Running"
 
 
-# -----------------------------
+# ==========================================
 # RUN
-# -----------------------------
+# ==========================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
