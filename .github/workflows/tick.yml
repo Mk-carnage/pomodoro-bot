@@ -2,16 +2,16 @@ name: Pomodoro Tick
 
 on:
   schedule:
-    - cron: "*/1 * * * *"   # every 1 minute
-  workflow_dispatch:        # allows manual run from Actions tab
+    - cron: "*/1 * * * *"
+  workflow_dispatch:
 
 jobs:
   tick:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Ping Pomodoro Tick Endpoint
+      - name: Ping Tick Endpoint
         run: |
           curl -X GET "https://pomodoro-bot-dbmb.onrender.com/tick" \
-               -H "User-Agent: GitHubActionsCron" \
-               --silent --show-error
+            -H "User-Agent: GitHubActionsCron" \
+            --silent --show-error
