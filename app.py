@@ -1,6 +1,13 @@
 # app.py
+"""
+Pomodoro Bot - /tick version (no background threads)
+- Uses a /tick HTTP endpoint to process expired timers.
+- Intended to be called by an external scheduler (Render Cron / UptimeRobot / any cron) every 1 minute.
+- Keeps long-term OAuth fixes: token cache, auto-refresh, forced refresh before important notifications, retry logic.
+- All original features preserved: start/break/status/tasks/queue/export/history/xp/streaks.
+"""
+
 import os
-import threading
 import time
 import json
 from datetime import datetime, timedelta, timezone
@@ -24,16 +31,12 @@ except Exception:
 MONGO_URI = os.getenv("MONGO_URI", "")
 MONGO_DB = os.getenv("MONGO_DB", "pomodoro_db")
 
-# Must be the bot incoming URL you confirmed
+# Must be your bot incoming URL
 ZOHO_INCOMING_URL = os.getenv("ZOHO_INCOMING_URL", "https://cliq.zoho.com/api/v2/bots/pomodorobot/incoming")
 
-# OAuth envs (server-based client)
 CLIENT_ID = os.getenv("CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")
 REFRESH_TOKEN = os.getenv("REFRESH_TOKEN", "")
-
-# Access token (populated at runtime)
-ZOHO_OAUTH_TOKEN = ""  # "Zoho-oauthtoken xxxxx"
 
 LOCAL_TZ_NAME = os.getenv("LOCAL_TZ", "Asia/Kolkata")
 try:
@@ -57,24 +60,33 @@ col_history = db.get_collection("history")    # all completed sessions
 col_tasks = db.get_collection("tasks")        # queued tasks per user
 col_users = db.get_collection("users")        # streaks, scores, meta
 
-# Create indexes (optional, ignore if exists)
+# index
 try:
     col_timers.create_index("user", unique=True)
 except Exception:
     pass
 
 # ---------------------------
-# In-memory structures & locks
+# App + in-memory
 # ---------------------------
 app = Flask(__name__)
+
+# in-memory timers cache (rehydrated from DB at boot)
 timers = {}  # user_id -> timer dict (end as datetime aware UTC)
-timers_lock = threading.Lock()
+timers_lock = None  # will be set to a simple object lock below
 
+# ---------------------------
 # OAuth token tracking
+# ---------------------------
+ZOHO_OAUTH_TOKEN = ""  # "Zoho-oauthtoken xxxxx"
 ACCESS_TOKEN_ISSUED_AT = 0.0
-TOKEN_LIFETIME = 3600  # seconds - Zoho standard
+TOKEN_LIFETIME = 3600
 TOKEN_REFRESH_THRESHOLD = 50 * 60  # 50 minutes
+token_refresh_lock = None  # will be set to a lock below
 
+# Initialize locks
+import threading
+timers_lock = threading.Lock()
 token_refresh_lock = threading.Lock()
 
 # ---------------------------
@@ -183,14 +195,11 @@ def refresh_access_token(force=False):
     """
     global ZOHO_OAUTH_TOKEN, ACCESS_TOKEN_ISSUED_AT
 
-    # quick check: if not forcing and token is fresh enough, skip
     now = time.time()
     if not force and ACCESS_TOKEN_ISSUED_AT and (now - ACCESS_TOKEN_ISSUED_AT) < TOKEN_REFRESH_THRESHOLD:
         return True
 
-    # single refresh at a time
     with token_refresh_lock:
-        # re-check inside lock
         now = time.time()
         if not force and ACCESS_TOKEN_ISSUED_AT and (now - ACCESS_TOKEN_ISSUED_AT) < TOKEN_REFRESH_THRESHOLD:
             return True
@@ -226,7 +235,6 @@ def send_message(text, max_retries=1):
     Sends a plain text message through bot incoming webhook.
     Ensures token is sufficiently fresh before send, retries on 401 or explicit invalid_oauth text.
     """
-    # Ensure token present and fresh
     if not refresh_access_token():
         print("❌ Cannot refresh access token before sending message.")
         return None
@@ -244,33 +252,27 @@ def send_message(text, max_retries=1):
             r = None
 
         if r is None:
-            # try once more after tiny wait
             time.sleep(0.5)
             continue
 
-        # If successful (200 or 201), return the response
         if r.status_code in (200, 201, 204):
-            # debug log
             try:
                 print(f"📤 Message sent (status {r.status_code}): {text[:120]}")
             except Exception:
                 pass
             return r
 
-        # If unauthorized, refresh and retry
         text_lower = (r.text or "").lower()
         if r.status_code == 401 or "invalid_oauth" in text_lower or "invalid token" in text_lower:
             print("⚠️ Received unauthorized response from Zoho, attempting token refresh and retry.")
             if refresh_access_token(force=True):
                 headers["Authorization"] = ZOHO_OAUTH_TOKEN
-                # small backoff
                 time.sleep(0.5)
                 continue
             else:
                 print("❌ Refresh failed after 401 during send_message.")
                 return r
 
-        # For other 4xx/5xx, do not retry more than once
         print("⚠️ Zoho responded with status:", r.status_code, "body:", r.text)
         return r
 
@@ -283,7 +285,6 @@ def parse_incoming_request(data):
     if not isinstance(data, dict):
         return None, ""
 
-    # find text
     text = ""
     for key in ("raw", "message", "msg", "text", "raw_message", "raw_msg", "message_details", "rawMessage"):
         v = data.get(key)
@@ -298,7 +299,6 @@ def parse_incoming_request(data):
                 text = vv.strip()
                 break
 
-    # find user id
     user = None
     if data.get("user") and isinstance(data.get("user"), dict):
         user = data["user"].get("id") or data["user"].get("user_id")
@@ -310,7 +310,7 @@ def parse_incoming_request(data):
     return user, text
 
 # ---------------------------
-# Core logic: streaks & XP (same as before)
+# Core logic: streaks & XP
 # ---------------------------
 def update_streak_for_user(user_id):
     s = load_user_stats(user_id)
@@ -349,191 +349,202 @@ def count_pomodoros_today(user_id):
     return col_history.count_documents({"user": user_id, "date": today, "type": "pomodoro"})
 
 # ---------------------------
-# Timer watcher (robust with pre-refresh)
+# Extracted processing function (used by /tick)
 # ---------------------------
-def timer_watcher():
-    print("⏳ Timer watcher thread started.")
-    while True:
-        now = datetime.utcnow().replace(tzinfo=timezone.utc)
-        to_process = []
+def process_timer_expiry(uid, info):
+    """
+    Process a single expired timer (pomodoro or break) for user `uid`.
+    This function mirrors the logic previously in timer_watcher but is callable from /tick.
+    """
+    info_end = info.get("end")
+    if not isinstance(info_end, datetime):
+        info_end = iso_to_dt(info_end)
 
-        # collect expired timers and normalize in-memory
+    ttype = info.get("type", "pomodoro")
+
+    # Pomodoro completed
+    if ttype == "pomodoro":
+        task = info.get("task", "Untitled Task")
+        duration = int(info.get("duration", 25))
+
+        completed_at = datetime.utcnow().replace(tzinfo=timezone.utc)
+        hist_item = {
+            "user": uid,
+            "task": task,
+            "duration": duration,
+            "completed_at": dt_to_iso(completed_at),
+            "date": completed_at.strftime("%Y-%m-%d"),
+            "type": "pomodoro"
+        }
+        append_history(hist_item)
+
+        current_streak, longest = update_streak_for_user(uid)
+        gained, total_xp, level = update_score(uid, duration, current_streak)
+
+        # Ensure token fresh before important message
+        refresh_access_token(force=True)
+
+        send_message(
+            f"⏰ Pomodoro completed!\n"
+            f"✔ Task: **{task}** ({duration} min)\n\n"
+            f"🔥 Streak: {current_streak} days\n"
+            f"🏆 Longest streak: {longest} days\n\n"
+            f"🎯 XP earned: +{gained}\n"
+            f"💠 Total XP: {total_xp}\n"
+            f"⭐ Level: {level}"
+        )
+
+        # create auto-break
+        completed_today = count_pomodoros_today(uid)
+        auto_break_min = 15 if (completed_today % 4 == 0) else 5
+        new_break_end = datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(minutes=auto_break_min)
+
         with timers_lock:
-            for uid, info in list(timers.items()):
-                try:
-                    end = info.get("end")
-                    if not isinstance(end, datetime):
-                        end_dt = iso_to_dt(end)
-                        timers[uid]["end"] = end_dt
-                    else:
-                        end_dt = end if end.tzinfo is not None else end.replace(tzinfo=timezone.utc)
+            timers[uid] = {
+                "type": "break",
+                "end": new_break_end,
+                "task": f"Auto Break ({auto_break_min} min)",
+                "duration": auto_break_min,
+                "paused_pomodoro": None
+            }
 
-                    if now >= end_dt:
-                        to_process.append((uid, dict(timers[uid])))  # snapshot
-                except Exception as ex:
-                    print("⚠ timer malformed for", uid, "=> removing", ex)
-                    timers.pop(uid, None)
-                    try:
-                        remove_active_timer(uid)
-                    except Exception:
-                        pass
+        try:
+            set_active_timer(uid, {
+                "type": "break",
+                "end": dt_to_iso(new_break_end),
+                "task": f"Auto Break ({auto_break_min} min)",
+                "duration": auto_break_min,
+                "paused_pomodoro": None
+            })
+        except Exception as e:
+            print("DB write error (set_active_timer):", e)
 
-        # process expirations outside lock
-        for uid, info in to_process:
+        send_message(f"☕ Auto-break started for {auto_break_min} minutes. (Type `stop break` to cancel.)")
+
+    # Break completed
+    elif ttype == "break":
+        br_task = info.get("task", "Break")
+        br_duration = int(info.get("duration", 5))
+        paused = info.get("paused_pomodoro")
+
+        completed_at = datetime.utcnow().replace(tzinfo=timezone.utc)
+        hist_item = {
+            "user": uid,
+            "task": br_task,
+            "duration": br_duration,
+            "completed_at": dt_to_iso(completed_at),
+            "date": completed_at.strftime("%Y-%m-%d"),
+            "type": "break"
+        }
+        append_history(hist_item)
+
+        if paused:
+            remaining = int(paused.get("remaining_seconds", 0))
+            new_end = datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(seconds=remaining)
+            with timers_lock:
+                timers[uid] = {
+                    "type": "pomodoro",
+                    "end": new_end,
+                    "task": paused.get("task"),
+                    "duration": round(remaining / 60, 2),
+                    "paused_pomodoro": None
+                }
             try:
-                info_end = info.get("end")
-                if not isinstance(info_end, datetime):
-                    info_end = iso_to_dt(info_end)
-
-                ttype = info.get("type", "pomodoro")
-
-                # ---------- Pomodoro Completed ----------
-                if ttype == "pomodoro":
-                    task = info.get("task", "Untitled Task")
-                    duration = int(info.get("duration", 25))
-
-                    # append history (store ISO)
-                    completed_at = datetime.utcnow().replace(tzinfo=timezone.utc)
-                    hist_item = {
-                        "user": uid,
-                        "task": task,
-                        "duration": duration,
-                        "completed_at": dt_to_iso(completed_at),
-                        "date": completed_at.strftime("%Y-%m-%d"),
-                        "type": "pomodoro"
-                    }
-                    append_history(hist_item)
-
-                    # update streak & score
-                    current_streak, longest = update_streak_for_user(uid)
-                    gained, total_xp, level = update_score(uid, duration, current_streak)
-
-                    # Force-refresh the token before first important message — long-term fix
-                    refresh_access_token(force=True)
-
-                    # notify - guaranteed fresh token
-                    send_message(
-                        f"⏰ Pomodoro completed!\n"
-                        f"✔ Task: **{task}** ({duration} min)\n\n"
-                        f"🔥 Streak: {current_streak} days\n"
-                        f"🏆 Longest streak: {longest} days\n\n"
-                        f"🎯 XP earned: +{gained}\n"
-                        f"💠 Total XP: {total_xp}\n"
-                        f"⭐ Level: {level}"
-                    )
-
-                    # create auto-break
-                    completed_today = count_pomodoros_today(uid)
-                    auto_break_min = 15 if (completed_today % 4 == 0) else 5
-                    new_break_end = datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(minutes=auto_break_min)
-
-                    # put break in memory and persist
-                    with timers_lock:
-                        timers[uid] = {
-                            "type": "break",
-                            "end": new_break_end,
-                            "task": f"Auto Break ({auto_break_min} min)",
-                            "duration": auto_break_min,
-                            "paused_pomodoro": None
-                        }
-                    try:
-                        set_active_timer(uid, {
-                            "type": "break",
-                            "end": dt_to_iso(new_break_end),
-                            "task": f"Auto Break ({auto_break_min} min)",
-                            "duration": auto_break_min,
-                            "paused_pomodoro": None
-                        })
-                    except Exception as e:
-                        print("DB write error (set_active_timer):", e)
-
-                    # send break started (also safe due to pre-refresh on next loop)
-                    send_message(f"☕ Auto-break started for {auto_break_min} minutes. (Type `stop break` to cancel.)")
-
-                # ---------- Break Completed ----------
-                elif ttype == "break":
-                    br_task = info.get("task", "Break")
-                    br_duration = int(info.get("duration", 5))
-                    paused = info.get("paused_pomodoro")
-
-                    # save break history
-                    completed_at = datetime.utcnow().replace(tzinfo=timezone.utc)
-                    hist_item = {
-                        "user": uid,
-                        "task": br_task,
-                        "duration": br_duration,
-                        "completed_at": dt_to_iso(completed_at),
-                        "date": completed_at.strftime("%Y-%m-%d"),
-                        "type": "break"
-                    }
-                    append_history(hist_item)
-
-                    if paused:
-                        remaining = int(paused.get("remaining_seconds", 0))
-                        new_end = datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(seconds=remaining)
-                        with timers_lock:
-                            timers[uid] = {
-                                "type": "pomodoro",
-                                "end": new_end,
-                                "task": paused.get("task"),
-                                "duration": round(remaining / 60, 2),
-                                "paused_pomodoro": None
-                            }
-                        # persist resumed pomodoro
-                        try:
-                            set_active_timer(uid, {
-                                "type": "pomodoro",
-                                "end": dt_to_iso(new_end),
-                                "task": paused.get("task"),
-                                "duration": round(remaining / 60, 2),
-                                "paused_pomodoro": None
-                            })
-                        except Exception as e:
-                            print("DB write error (resume set_active_timer):", e)
-
-                        # refresh then notify
-                        refresh_access_token(force=True)
-                        send_message(f"⏰ Break over — resuming **{paused.get('task')}** with {remaining//60}m {remaining%60}s left.")
-                    else:
-                        refresh_access_token(force=True)
-                        send_message("☕ Break over! Ready to get back to work.")
-                        # suggest next queued task if available
-                        queue = load_tasks_for_user(uid)
-                        if queue:
-                            next_task = queue[0]
-                            send_message(f"⏭ Next task in queue: **{next_task['task']}** ({next_task['duration']} min). Type `start next` to continue.")
-                        # cleanup DB timer
-                        try:
-                            remove_active_timer(uid)
-                        except Exception as e:
-                            print("DB remove error:", e)
-                        with timers_lock:
-                            timers.pop(uid, None)
-
-                # CLEANUP: If the processed timer still matches the in-memory timer (within 1s), remove it
-                with timers_lock:
-                    cur = timers.get(uid)
-                    if cur is None:
-                        pass
-                    else:
-                        cur_end = cur.get("end")
-                        if not isinstance(cur_end, datetime):
-                            cur_end = iso_to_dt(cur_end)
-                        # allow 1 second tolerance
-                        if cur.get("type") == info.get("type") and abs((cur_end - info_end).total_seconds()) < 1:
-                            timers.pop(uid, None)
-                            try:
-                                remove_active_timer(uid)
-                            except Exception:
-                                pass
-
+                set_active_timer(uid, {
+                    "type": "pomodoro",
+                    "end": dt_to_iso(new_end),
+                    "task": paused.get("task"),
+                    "duration": round(remaining / 60, 2),
+                    "paused_pomodoro": None
+                })
             except Exception as e:
-                print("⚠️ Error processing timer for user", uid, ":", e)
+                print("DB write error (resume set_active_timer):", e)
 
-        time.sleep(1)
+            refresh_access_token(force=True)
+            send_message(f"⏰ Break over — resuming **{paused.get('task')}** with {remaining//60}m {remaining%60}s left.")
+        else:
+            refresh_access_token(force=True)
+            send_message("☕ Break over! Ready to get back to work.")
+            queue = load_tasks_for_user(uid)
+            if queue:
+                next_task = queue[0]
+                send_message(f"⏭ Next task in queue: **{next_task['task']}** ({next_task['duration']} min). Type `start next` to continue.")
+            try:
+                remove_active_timer(uid)
+            except Exception as e:
+                print("DB remove error:", e)
+            with timers_lock:
+                timers.pop(uid, None)
+
+    # cleanup: if processed timer still matches in-memory (within tolerance), remove it
+    with timers_lock:
+        cur = timers.get(uid)
+        if cur is None:
+            return
+        cur_end = cur.get("end")
+        if not isinstance(cur_end, datetime):
+            cur_end = iso_to_dt(cur_end)
+        # allow 1 second tolerance
+        try:
+            if cur.get("type") == info.get("type") and abs((cur_end - info_end).total_seconds()) < 1:
+                timers.pop(uid, None)
+                try:
+                    remove_active_timer(uid)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 # ---------------------------
-# Command parsing & routes (kept same as original, small improvements)
+# /tick endpoint (called by scheduler)
+# ---------------------------
+@app.route("/tick", methods=["GET", "POST"])
+def tick_route():
+    """
+    Scheduler should call this endpoint every minute.
+    It processes timers that have expired and triggers notifications.
+    """
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    to_process = []
+
+    # Normalize in-memory timers; rehydrate missing ones from DB if necessary
+    with timers_lock:
+        # If timers empty, try rehydrate (ensures restart-safe)
+        if not timers:
+            try:
+                rehydrate_timers()
+            except Exception as e:
+                print("rehydrate during tick failed:", e)
+
+        for uid, info in list(timers.items()):
+            try:
+                end = info.get("end")
+                if not isinstance(end, datetime):
+                    end_dt = iso_to_dt(end)
+                    timers[uid]["end"] = end_dt
+                    end = end_dt
+                if now >= end:
+                    # snapshot current info
+                    to_process.append((uid, dict(timers[uid])))
+            except Exception as ex:
+                print("⚠ timer malformed for", uid, "=> removing", ex)
+                timers.pop(uid, None)
+                try:
+                    remove_active_timer(uid)
+                except Exception:
+                    pass
+
+    # process outside lock
+    for uid, info in to_process:
+        try:
+            process_timer_expiry(uid, info)
+        except Exception as e:
+            print("tick processing error for", uid, e)
+
+    return "OK", 200
+
+# ---------------------------
+# Command parsing & routes (kept same as earlier)
 # ---------------------------
 def parse_start_command(text):
     parts = text.strip().split()
@@ -563,7 +574,7 @@ def pomodoro_route():
         return jsonify({"reply": "❌ Missing user id."}), 400
     raw_lower = (raw or "").strip().lower()
 
-    # --- ADD TASK ---
+    # ADD TASK
     if raw_lower.startswith("add task"):
         parts = raw.strip().split()
         if len(parts) < 4:
@@ -578,7 +589,7 @@ def pomodoro_route():
         save_tasks_for_user(user, queue)
         return jsonify({"reply": f"📝 Added task: **{task_name}** ({duration} min)"})
 
-    # --- SHOW TASKS ---
+    # SHOW TASKS
     if raw_lower == "tasks":
         q = load_tasks_for_user(user)
         if not q:
@@ -588,7 +599,7 @@ def pomodoro_route():
             out += f"{i}. {t['task']} ({t['duration']} min)\n"
         return jsonify({"reply": out})
 
-    # --- START NEXT ---
+    # START NEXT
     if raw_lower == "start next":
         q = load_tasks_for_user(user)
         if not q:
@@ -603,7 +614,7 @@ def pomodoro_route():
         set_active_timer(user, {"type": "pomodoro", "end": dt_to_iso(end), "task": task_name, "duration": duration})
         return jsonify({"reply": f"▶️ Started next task: **{task_name}** ({duration} min)"})
 
-    # --- DONE (remove from queue) ---
+    # DONE remove
     if raw_lower.startswith("done"):
         parts = raw_lower.split()
         if len(parts) != 2 or not parts[1].isdigit():
@@ -616,12 +627,12 @@ def pomodoro_route():
         save_tasks_for_user(user, q)
         return jsonify({"reply": f"✔ Removed task: **{removed['task']}**"})
 
-    # --- CLEAR TASKS ---
+    # CLEAR TASKS
     if raw_lower == "clear tasks":
         save_tasks_for_user(user, [])
         return jsonify({"reply": "🗑 Cleared all tasks."})
 
-    # --- BREAK ---
+    # BREAK
     if raw_lower.startswith("break"):
         parts = raw.strip().split()
         if len(parts) == 1:
@@ -644,7 +655,7 @@ def pomodoro_route():
         send_message(f"☕ Break started for {minutes} minutes. (Type `stop break` to cancel and resume.)")
         return jsonify({"reply": f"☕ Break started for {minutes} minutes."})
 
-    # --- STOP BREAK ---
+    # STOP BREAK
     if raw_lower in ("stop break", "stopbreak", "break stop"):
         with timers_lock:
             cur = timers.get(user)
@@ -662,7 +673,7 @@ def pomodoro_route():
             else:
                 return jsonify({"reply": "🛑 Break stopped."})
 
-    # --- START Pomodoro ---
+    # START Pomodoro
     if raw_lower.startswith("start"):
         duration, task_name = parse_start_command(raw)
         end = datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(minutes=duration)
@@ -676,7 +687,7 @@ def pomodoro_route():
         refresh_access_token(force=True)
         return jsonify({"reply": f"🍅 Started **{task_name}** ({duration} min)"})
 
-    # --- STATUS ---
+    # STATUS
     if raw_lower in ("status", "time", "progress"):
         with timers_lock:
             cur = timers.get(user)
@@ -688,7 +699,7 @@ def pomodoro_route():
             else:
                 return jsonify({"reply": f"☕ Break — {remaining//60}m {remaining%60}s left"})
 
-    # --- STOP / CANCEL ---
+    # STOP / CANCEL
     if raw_lower in ("stop", "end", "cancel"):
         with timers_lock:
             if user in timers:
@@ -697,7 +708,7 @@ def pomodoro_route():
                 return jsonify({"reply": "🛑 Stopped."})
         return jsonify({"reply": "❌ No active session."})
 
-    # --- RESUME (from paused break) ---
+    # RESUME (from paused break)
     if raw_lower == "resume":
         with timers_lock:
             cur = timers.get(user)
@@ -711,11 +722,11 @@ def pomodoro_route():
                 return jsonify({"reply": f"⏯ Resumed **{paused.get('task')}** with {remaining//60}m {remaining%60}s left."})
         return jsonify({"reply": "❌ Nothing to resume."})
 
-    # --- TODAY SUMMARY ---
+    # TODAY
     if raw_lower == "today":
         return jsonify({"reply": build_daily_summary(user)})
 
-    # --- WEEK ---
+    # WEEK
     if raw_lower == "week":
         entries = list(col_history.find({"user": user}).sort("completed_at", -1).limit(21))
         if not entries:
@@ -728,26 +739,26 @@ def pomodoro_route():
             out += f"{d}: {'🍅'*c} ({c})\n"
         return jsonify({"reply": out})
 
-    # --- CHART / ANALYTICS ---
+    # CHART / ANALYTICS
     if raw_lower in ("chart", "weekly chart", "analytics", "weekly analytics"):
         text = get_weekly_chart(user)
         return jsonify({"reply": text})
 
-    # --- STREAK ---
+    # STREAK
     if raw_lower == "streak":
         s = load_user_stats(user)
         return jsonify({"reply": f"🔥 Streak: {s.get('current_streak',0)} days\n🏆 Longest: {s.get('longest_streak',0)} days"})
 
-    # --- SCORE ---
+    # SCORE
     if raw_lower == "score":
         s = load_user_stats(user)
         return jsonify({"reply": f"🎯 XP: {s.get('xp',0)}\n⭐ Level: {s.get('level',1)}"})
 
-    # --- EXPORT commands routed to /export for PDF generation ---
+    # EXPORT
     if raw_lower.startswith("export"):
         return export_report_internal(user, raw_lower)
 
-    # --- SUGGESTIONS ---
+    # SUGGESTIONS
     if raw_lower in ("suggest", "ai suggest", "suggestions"):
         items = smart_suggestions(user)
         reply = "🤖 *Here are some suggestions:* \n"
@@ -755,11 +766,10 @@ def pomodoro_route():
             reply += f"• {i}\n"
         return jsonify({"reply": reply})
 
-    # --- fallback/help ---
     return jsonify({"reply":"Commands: start | break | stop break | resume | status | stop | today | week | chart | streak | score | add task | tasks | start next | done | clear tasks | export today | export week | export month | suggest"})
 
 # ---------------------------
-# Daily / weekly analytics helpers
+# Analytics / export helpers (unchanged)
 # ---------------------------
 def get_weekly_chart(user_id):
     docs = list(col_history.find({"user": user_id}))
@@ -812,9 +822,6 @@ def build_daily_summary(user_id):
     s = f"📊 YOUR DAILY SUMMARY ({today})\n\nCompleted: {len(entries)} tasks\nTotal focus time: {total} min\n\nTasks:\n" + "\n".join(completed_tasks)
     return s
 
-# ---------------------------
-# Smart suggestions
-# ---------------------------
 def smart_suggestions(user_id):
     history = list(col_history.find({"user": user_id}).sort("completed_at", -1).limit(200))
     tasks = load_tasks_for_user(user_id)
@@ -863,7 +870,7 @@ def smart_suggestions(user_id):
     return suggestions
 
 # ---------------------------
-# PDF generation / export routes
+# PDF generation / export routes (unchanged)
 # ---------------------------
 def create_pdf(filepath, title, lines):
     if not REPORTLAB_AVAILABLE:
@@ -980,45 +987,72 @@ def export_route():
     return export_report_internal(user, raw.lower().strip())
 
 # ---------------------------
-# Boot-time watcher start (runs even before first request) - robust for Render
+# OAuth callback/exchange (helper for getting refresh token manually)
 # ---------------------------
+@app.route("/oauth/callback")
+def oauth_callback():
+    code = request.args.get("code")
+    if not code:
+        return "❌ No authorization code received.", 400
+    return f"""
+        <h2>✅ Authorization Code Received</h2>
+        <p>Copy this code and use it in /oauth/exchange:</p>
+        <pre style='padding:10px;border:1px solid #ccc;background:#f7f7f7;'>{code}</pre>
+    """, 200
+
+@app.route("/oauth/exchange", methods=["POST"])
+def oauth_exchange():
+    code = request.json.get("code")
+    if not code:
+        return jsonify({"error": "Missing 'code' field"}), 400
+    TOKEN_URL = "https://accounts.zoho.com/oauth/v2/token"
+    payload = {
+        "grant_type": "authorization_code",
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "redirect_uri": request.json.get("redirect_uri", ""),  # provide if needed
+        "code": code
+    }
+    try:
+        r = requests.post(TOKEN_URL, data=payload)
+        response_data = r.json()
+        if "refresh_token" in response_data:
+            return jsonify({
+                "status": "success",
+                "message": "🎉 Refresh token generated successfully!",
+                "refresh_token": response_data["refresh_token"],
+                "access_token": response_data.get("access_token")
+            })
+        return jsonify(response_data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ---------------------------
+# Boot / startup
+# ---------------------------
+# Rehydrate in-memory timers from DB on boot
 try:
     rehydrate_timers()
 except Exception as e:
     print("rehydrate failed at boot:", e)
 
-# Start watcher now (guarded so we don't start multiple)
+# Try one initial token refresh (best-effort)
 try:
-    if not getattr(app, "threads_started", False):
-        threading.Thread(target=timer_watcher, daemon=True).start()
-        app.threads_started = True
-        print("🚀 Timer watcher started on boot")
-except Exception as e:
-    print("Boot watcher start failed:", e)
+    refresh_access_token(force=True)
+except Exception:
+    pass
 
 # ---------------------------
-# main
+# Run
 # ---------------------------
 if __name__ == "__main__":
-    # Ensure timers rehydrated on dev run
+    # rehydrate again in dev-run
     try:
         rehydrate_timers()
     except Exception as e:
         print("rehydrate_timers failed:", e)
-
-    # Start watcher again (idempotent guard)
-    try:
-        if not getattr(app, "threads_started", False):
-            threading.Thread(target=timer_watcher, daemon=True).start()
-            app.threads_started = True
-            print("🚀 Timer watcher started in __main__")
-    except Exception as e:
-        print("Failed to start watcher in __main__:", e)
-
-    # initial token refresh attempt (best-effort)
     try:
         refresh_access_token(force=True)
     except Exception:
         pass
-
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
