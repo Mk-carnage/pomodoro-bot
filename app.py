@@ -427,25 +427,26 @@ def timer_watcher():
         time.sleep(1)
 
 
-# -----------------------------------------------
-# Pinging for reducing the sleep of the server
-# -----------------------------------------------
 
+# -----------------------------
+# Start background threads on first request
+# -----------------------------
 @app.route("/", methods=["GET", "HEAD"])
 def home():
     return "OK", 200
 
 
-
-# -----------------------------
-# Start background threads on first request
-# -----------------------------
 @app.before_request
 def start_threads():
+    # Only trigger threads for /pomodoro POST requests
+    if request.path != "/pomodoro":
+        return
+
     if not getattr(app, "threads_started", False):
         threading.Thread(target=timer_watcher, daemon=True).start()
         app.threads_started = True
         print("🚀 Background threads started (timer watcher).")
+
 
 # ============================================
 # PART 3 — Routes: /pomodoro, weekly chart, summaries
