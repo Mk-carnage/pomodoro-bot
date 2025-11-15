@@ -1,5 +1,6 @@
 # ============================================
-# PART 1 — Imports, Config, JSON Helpers
+# Pomodoro Bot (Flask) - Full code with export fix
+# and Smart AI Suggestions (Option A, calm & friendly)
 # ============================================
 
 import os
@@ -218,6 +219,7 @@ def count_pomodoros_today(user_id):
            h.get("date") == today and
            h.get("type", "pomodoro") == "pomodoro"
     )
+
 # ============================================
 # PART 2 — Break System, Timer Watcher & Threads
 # ============================================
@@ -434,6 +436,7 @@ def start_threads():
         threading.Thread(target=timer_watcher, daemon=True).start()
         app.threads_started = True
         print("🚀 Background threads started (timer watcher).")
+
 # ============================================
 # PART 3 — Routes: /pomodoro, weekly chart, summaries
 # ============================================
@@ -494,6 +497,84 @@ def get_weekly_chart(user_id):
 # -----------------------------
 def build_today_summary(user_id):
     return build_daily_summary(user_id)
+
+
+# -----------------------------------------
+# Smart AI Suggestions (Option A: Calm & Friendly)
+# -----------------------------------------
+def smart_suggestions(user_id):
+    history = load_history()
+    tasks = load_tasks().get(user_id, [])
+    scores = load_scores().get(user_id, {"xp": 0, "level": 1})
+    streaks = load_streaks().get(user_id, {"current_streak": 0})
+
+    suggestions = []
+    now = datetime.now(LOCAL_TZ)
+    hour = now.hour
+    level = scores.get("level", 1)
+    streak = streaks.get("current_streak", 0)
+
+    # -------------- 1. Time-of-day suggestions --------------
+    if hour < 12:
+        suggestions.append("A fresh morning! Maybe review something you learned recently.")
+    elif 12 <= hour < 17:
+        suggestions.append("Good afternoon! This is a great time for focused deep work.")
+    elif 17 <= hour < 21:
+        suggestions.append("Evening vibes — perfect for light review or creative tasks.")
+    else:
+        suggestions.append("It's pretty late. How about planning tomorrow's tasks?")
+
+    # -------------- 2. Streak-based motivation --------------
+    if streak >= 5:
+        suggestions.append(f"You're on a {streak}-day streak! Keep the momentum with a short session.")
+    elif 1 <= streak <= 4:
+        suggestions.append("You're building consistency — one Pomodoro today will strengthen your streak.")
+    else:
+        suggestions.append("Starting your streak today can set a good tone for the week.")
+
+    # -------------- 3. XP / Level adaptive suggestions --------------
+    if level <= 3:
+        suggestions.append("You're at an early level — try a simple 15–20 min session to progress.")
+    elif 4 <= level <= 7:
+        suggestions.append("You're leveling up well — a single strong session can boost your XP.")
+    else:
+        suggestions.append("High-level focus! A long deep-work task might feel rewarding.")
+
+    # -------------- 4. Idle-time detection --------------
+    last_activity = None
+    for h in reversed(history):
+        if h.get("user") == user_id:
+            try:
+                last_activity = datetime.fromisoformat(h.get("completed_at"))
+            except:
+                pass
+            break
+
+    if last_activity:
+        idle_hours = (datetime.utcnow() - last_activity).total_seconds() / 3600
+        if idle_hours >= 3:
+            suggestions.append("It's been a while since your last session — a quick 10 min focus might help restart.")
+
+    # -------------- 5. Suggest queued tasks --------------
+    if tasks:
+        suggestions.append(f"You could continue your next queued task: **{tasks[0]['task']}**.")
+
+    # -------------- 6. Frequent past tasks --------------
+    freq = {}
+    for h in history:
+        if h.get("user") == user_id and h.get("type") == "pomodoro":
+            t = h.get("task")
+            freq[t] = freq.get(t, 0) + 1
+
+    if freq:
+        top_task = max(freq, key=freq.get)
+        suggestions.append(f"You've worked a lot on **{top_task}** — maybe continue improving it.")
+
+    # -------------- If nothing to suggest --------------
+    if not suggestions:
+        suggestions = ["Try a small 15-minute session to get started."]
+
+    return suggestions
 
 
 # -----------------------------
@@ -577,7 +658,12 @@ def pomodoro_route():
     # ---- Manual break ----
     if msg.startswith("break"):
         parts = raw.split()
-        minutes = 5 if len(parts) == 1 else int(parts[1])
+        if len(parts) == 1:
+            minutes = 5
+        elif len(parts) == 2 and parts[1].isdigit():
+            minutes = int(parts[1])
+        else:
+            return jsonify({"reply": "Usage: break OR break <minutes>"})
         start_manual_break(user, minutes)
         return jsonify({"reply": f"☕ Break started for {minutes} minutes."})
 
@@ -593,6 +679,7 @@ def pomodoro_route():
         with timers_lock:
             cur = timers.get(user)
             if cur and cur.get("type") == "break":
+                # user wants to start pomodoro during break — cancel break and start pomodoro
                 timers.pop(user, None)
             timers[user] = {"type": "pomodoro", "end": end, "task": task_name, "duration": duration, "paused_pomodoro": None}
         return jsonify({"reply": f"🍅 Started **{task_name}** ({duration} min)"})
@@ -604,13 +691,13 @@ def pomodoro_route():
             if not cur:
                 return jsonify({"reply": "❌ No active session."})
             remaining = int(max((cur["end"] - datetime.utcnow()).total_seconds(), 0))
-            ttype = cur.get("type")
+            ttype = cur.get("type", "pomodoro")
             if ttype == "pomodoro":
                 return jsonify({"reply": f"🍅 {cur['task']} — {remaining//60}m {remaining%60}s left"})
             else:
                 return jsonify({"reply": f"☕ Break — {remaining//60}m {remaining%60}s left"})
 
-    # ---- Stop session ----
+    # ---- Stop / Cancel ----
     if msg in ("stop", "end", "cancel"):
         with timers_lock:
             if user in timers:
@@ -618,7 +705,7 @@ def pomodoro_route():
                 return jsonify({"reply": "🛑 Stopped."})
         return jsonify({"reply": "❌ No active session."})
 
-    # ---- Resume ----
+    # ---- Resume (for paused pomodoro during break) ----
     if msg == "resume":
         with timers_lock:
             cur = timers.get(user)
@@ -627,14 +714,14 @@ def pomodoro_route():
                 remaining = paused.get("remaining_seconds", 0)
                 end = datetime.utcnow() + timedelta(seconds=remaining)
                 timers[user] = {"type": "pomodoro", "end": end, "task": paused.get("task"), "duration": round(remaining / 60, 2), "paused_pomodoro": None}
-                return jsonify({"reply": f"⏯ Resumed **{paused.get('task')}**"})
+                return jsonify({"reply": f"⏯ Resumed **{paused.get('task')}** with {remaining//60}m {remaining%60}s left."})
         return jsonify({"reply": "❌ Nothing to resume."})
 
     # ---- Today summary ----
     if msg == "today":
         return jsonify({"reply": build_today_summary(user)})
 
-    # ---- Week summary ----
+    # ---- Weekly summary (simple) ----
     if msg == "week":
         history = load_history()
         user_hist = [h for h in history if h.get("user") == user]
@@ -688,8 +775,16 @@ def pomodoro_route():
 
         return jsonify({"reply": "❌ Use: export today | export week | export month"})
 
-    # ---- Help ----
-    return jsonify({"reply": "Commands: start | break | stop break | resume | status | stop | today | week | chart | streak | score | add task | tasks | start next | done | clear tasks | export today | export week | export month"})
+    # ---- AI Suggestions ----
+    if msg in ("suggest", "ai suggest", "suggestions"):
+        items = smart_suggestions(user)
+        reply = "🤖 *You're doing great.* Here are some gentle suggestions:\n\n"
+        for i in items:
+            reply += f"• {i}\n"
+        return jsonify({"reply": reply})
+
+    # ---- Help / fallback ----
+    return jsonify({"reply": "Commands: start | break | stop break | resume | status | stop | today | week | chart | streak | score | add task | tasks | start next | done | clear tasks | export today | export week | export month | suggest"})
 
 # ============================================
 # PART 4 — PDF EXPORT + DOWNLOAD ROUTE + export handler
