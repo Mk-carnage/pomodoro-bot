@@ -504,6 +504,43 @@ def get_weekly_chart(user_id):
 # -----------------------------
 # Today summary wrapper (uses existing build_daily_summary)
 # -----------------------------
+def build_daily_summary(user_id):
+    history = load_history()
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    entries = [
+        h for h in history
+        if h.get("user") == user_id and h.get("date") == today
+    ]
+
+    if not entries:
+        return "📭 No activity today."
+
+    total = 0
+    pomos = 0
+    breaks = 0
+
+    out = "📅 **TODAY'S SUMMARY**\n\n"
+
+    for h in entries:
+        task = h.get("task", "Unknown")
+        dur = h.get("duration", 0)
+        ttype = h.get("type", "pomodoro")
+        out += f"- {task} ({dur} min, {ttype})\n"
+        if ttype == "pomodoro":
+            total += dur
+            pomos += 1
+        else:
+            breaks += 1
+
+    out += f"\n🍅 Pomodoros: {pomos}\n"
+    out += f"☕ Breaks: {breaks}\n"
+    out += f"🕒 Total Focus Time: {total} min"
+
+    return out
+
+
+
 def build_today_summary(user_id):
     return build_daily_summary(user_id)
 
