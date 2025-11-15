@@ -1,4 +1,6 @@
-Flask==3.0.0
-gunicorn
-requests
-reportlab
+Flask==3.0.2
+pymongo==4.6.1
+requests==2.31.0
+reportlab==4.0.7
+gunicorn==21.2.0
+python-dateutil==2.8.2
