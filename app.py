@@ -1,4 +1,3 @@
-# app.py
 import os
 import threading
 import time
@@ -19,23 +18,22 @@ CLIENT_ID = os.getenv("CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")
 REFRESH_TOKEN = os.getenv("REFRESH_TOKEN", "")
 
-# Summary times (Indian work hours)
+# Summary times
 MORNING_HOUR = 9
 EVENING_HOUR = 17
-
 LOCAL_TZ = ZoneInfo("Asia/Kolkata")
 
-# Data files
+# JSON files
 HISTORY_FILE = "history.json"
 SUMMARY_STATE_FILE = "summary_state.json"
 STREAK_FILE = "streaks.json"
 SCORE_FILE = "scores.json"
+TASK_FILE = "tasks.json"
 
 app = Flask(__name__)
-
-# Timer storage
 timers = {}
 timers_lock = threading.Lock()
+
 
 
 # ==========================================
@@ -54,36 +52,21 @@ def save_file(path, data):
         json.dump(data, f, indent=4)
 
 
-def load_history():
-    return load_file(HISTORY_FILE, [])
+def load_history(): return load_file(HISTORY_FILE, [])
+def save_history(data): save_file(HISTORY_FILE, data)
 
+def load_summary_state(): return load_file(SUMMARY_STATE_FILE, {})
+def save_summary_state(data): save_file(SUMMARY_STATE_FILE, data)
 
-def save_history(data):
-    save_file(HISTORY_FILE, data)
+def load_streaks(): return load_file(STREAK_FILE, {})
+def save_streaks(data): save_file(STREAK_FILE, data)
 
+def load_scores(): return load_file(SCORE_FILE, {})
+def save_scores(data): save_file(SCORE_FILE, data)
 
-def load_summary_state():
-    return load_file(SUMMARY_STATE_FILE, {})
+def load_tasks(): return load_file(TASK_FILE, {})
+def save_tasks(data): save_file(TASK_FILE, data)
 
-
-def save_summary_state(data):
-    save_file(SUMMARY_STATE_FILE, data)
-
-
-def load_streaks():
-    return load_file(STREAK_FILE, {})
-
-
-def save_streaks(data):
-    save_file(STREAK_FILE, data)
-
-
-def load_scores():
-    return load_file(SCORE_FILE, {})
-
-
-def save_scores(data):
-    save_file(SCORE_FILE, data)
 
 
 # ==========================================
@@ -101,6 +84,7 @@ def send_message(text):
         r = requests.post(ZOHO_INCOMING_URL, json=payload, headers=headers)
 
     return r.text
+
 
 
 # ==========================================
@@ -123,6 +107,7 @@ def refresh_access_token():
         ZOHO_OAUTH_TOKEN = "Zoho-oauthtoken " + r["access_token"]
 
 
+
 # ==========================================
 # PARSE START COMMAND
 # ==========================================
@@ -136,8 +121,8 @@ def parse_start_command(msg):
         task = " ".join(parts[2:])
     elif len(parts) >= 2:
         task = " ".join(parts[1:])
-
     return duration, task
+
 
 
 # ==========================================
@@ -171,18 +156,15 @@ def update_streak_for_user(user_id):
     return user["current_streak"], user["longest_streak"]
 
 
+
 # ==========================================
 # FOCUS SCORE SYSTEM
 # ==========================================
 def calculate_level(xp):
-    if xp < 100:
-        return 1
-    elif xp < 250:
-        return 2
-    elif xp < 500:
-        return 3
-    elif xp < 1000:
-        return 4
+    if xp < 100: return 1
+    elif xp < 250: return 2
+    elif xp < 500: return 3
+    elif xp < 1000: return 4
     return xp // 500 + 4
 
 
@@ -205,8 +187,9 @@ def update_score(user_id, duration, streak):
     return gained, user["xp"], user["level"]
 
 
+
 # ==========================================
-# TIMER WATCHER
+# TIMER WATCHER (also suggests next task)
 # ==========================================
 def timer_watcher():
     while True:
@@ -233,10 +216,10 @@ def timer_watcher():
             })
             save_history(history)
 
-            # Streak update
+            # streak update
             current, longest = update_streak_for_user(uid)
 
-            # Score update
+            # score update
             gained, total_xp, level = update_score(uid, duration, current)
 
             send_message(
@@ -249,14 +232,25 @@ def timer_watcher():
                 f"⭐ Level: {level}"
             )
 
+            # Suggest next task
+            tasks = load_tasks()
+            user_tasks = tasks.get(uid, [])
+            if user_tasks:
+                next_task = user_tasks[0]
+                send_message(
+                    f"⏭ Next task: **{next_task['task']}** ({next_task['duration']} min)\n"
+                    f"Type `start next` to continue."
+                )
+
             with timers_lock:
                 timers.pop(uid, None)
 
         time.sleep(1)
 
 
+
 # ==========================================
-# SUMMARY SYSTEM (9 AM + 5 PM)
+# DAILY SUMMARY SCHEDULER
 # ==========================================
 def build_daily_summary(uid):
     history = load_history()
@@ -292,6 +286,7 @@ def summary_scheduler():
         time.sleep(20)
 
 
+
 # ==========================================
 # FLASK STARTUP THREADS
 # ==========================================
@@ -303,6 +298,7 @@ def start_threads():
         app.threads_started = True
 
 
+
 # ==========================================
 # BOT ENDPOINT
 # ==========================================
@@ -312,6 +308,103 @@ def pomodoro():
     msg = data.get("raw", "").lower()
     user = data.get("user")
 
+    # ============================
+    # 1. ADD TASK
+    # ============================
+    if msg.startswith("add task"):
+        parts = data["raw"].split()
+        if len(parts) < 4:
+            return jsonify({"reply": "Usage: add task <task name> <duration>"})
+
+        duration = parts[-1]
+        if not duration.isdigit():
+            return jsonify({"reply": "Duration must be a number (minutes)."})
+
+        duration = int(duration)
+        task_name = " ".join(parts[2:-1])
+
+        tasks = load_tasks()
+        user_tasks = tasks.get(user, [])
+        user_tasks.append({"task": task_name, "duration": duration})
+        tasks[user] = user_tasks
+        save_tasks(tasks)
+
+        return jsonify({"reply": f"📝 Added task: **{task_name}** ({duration} min)"})
+
+    # ============================
+    # 2. SHOW TASKS
+    # ============================
+    if msg == "tasks":
+        tasks = load_tasks()
+        user_tasks = tasks.get(user, [])
+
+        if not user_tasks:
+            return jsonify({"reply": "📭 No tasks in queue."})
+
+        out = "📋 **Task Queue:**\n\n"
+        for i, t in enumerate(user_tasks, start=1):
+            out += f"{i}. {t['task']} ({t['duration']} min)\n"
+
+        return jsonify({"reply": out})
+
+    # ============================
+    # 3. START NEXT TASK
+    # ============================
+    if msg == "start next":
+        tasks = load_tasks()
+        user_tasks = tasks.get(user, [])
+
+        if not user_tasks:
+            return jsonify({"reply": "📭 No tasks in the queue."})
+
+        next_task = user_tasks.pop(0)
+        tasks[user] = user_tasks
+        save_tasks(tasks)
+
+        duration = next_task["duration"]
+        task_name = next_task["task"]
+
+        end = datetime.utcnow() + timedelta(minutes=duration)
+
+        with timers_lock:
+            timers[user] = {"end": end, "task": task_name, "duration": duration}
+
+        return jsonify({"reply": f"▶️ Started next task: **{task_name}** ({duration} min)"})
+
+    # ============================
+    # 4. REMOVE TASK
+    # ============================
+    if msg.startswith("done"):
+        parts = msg.split()
+        if len(parts) != 2 or not parts[1].isdigit():
+            return jsonify({"reply": "Usage: done <task_number>"})
+
+        index = int(parts[1]) - 1
+
+        tasks = load_tasks()
+        user_tasks = tasks.get(user, [])
+
+        if index < 0 or index >= len(user_tasks):
+            return jsonify({"reply": "❌ Invalid task number."})
+
+        removed = user_tasks.pop(index)
+        tasks[user] = user_tasks
+        save_tasks(tasks)
+
+        return jsonify({"reply": f"✔ Removed task: **{removed['task']}**"})
+
+    # ============================
+    # 5. CLEAR TASKS
+    # ============================
+    if msg == "clear tasks":
+        tasks = load_tasks()
+        tasks[user] = []
+        save_tasks(tasks)
+        return jsonify({"reply": "🗑 Cleared all tasks."})
+
+    # ============================
+    # 6. START POMODORO
+    # ============================
     if msg.startswith("start"):
         duration, task = parse_start_command(data["raw"])
         end = datetime.utcnow() + timedelta(minutes=duration)
@@ -321,26 +414,39 @@ def pomodoro():
 
         return jsonify({"reply": f"🍅 Started **{task}** ({duration} min)"})
 
-    if msg.startswith("status"):
+    # ============================
+    # 7. STATUS
+    # ============================
+    if msg == "status":
         with timers_lock:
             if user not in timers:
-                return jsonify({"reply": "❌ No active session"})
+                return jsonify({"reply": "❌ No active session."})
+
             info = timers[user]
             remaining = info["end"] - datetime.utcnow()
             sec = max(int(remaining.total_seconds()), 0)
             return jsonify({"reply": f"{info['task']} — {sec//60}m {sec%60}s left"})
 
-    if msg.startswith("stop"):
+    # ============================
+    # 8. STOP
+    # ============================
+    if msg == "stop":
         with timers_lock:
             if user in timers:
                 timers.pop(user, None)
-                return jsonify({"reply": "🛑 Stopped"})
-        return jsonify({"reply": "❌ No session to stop"})
+                return jsonify({"reply": "🛑 Stopped."})
+        return jsonify({"reply": "❌ No active session."})
 
-    if msg.startswith("today"):
+    # ============================
+    # 9. TODAY SUMMARY
+    # ============================
+    if msg == "today":
         return jsonify({"reply": build_daily_summary(user)})
 
-    if msg.startswith("week"):
+    # ============================
+    # 10. WEEK SUMMARY
+    # ============================
+    if msg == "week":
         history = load_history()
         user_hist = [h for h in history if h["user"] == user]
 
@@ -357,21 +463,28 @@ def pomodoro():
 
         return jsonify({"reply": out})
 
-    if msg.startswith("streak"):
+    # ============================
+    # 11. STREAK
+    # ============================
+    if msg == "streak":
         streaks = load_streaks()
         s = streaks.get(user)
         if not s:
             return jsonify({"reply": "🔥 No streak yet"})
         return jsonify({"reply": f"🔥 Streak: {s['current_streak']} days\n🏆 Longest: {s['longest_streak']} days"})
 
-    if msg.startswith("score"):
+    # ============================
+    # 12. SCORE
+    # ============================
+    if msg == "score":
         scores = load_scores()
         s = scores.get(user)
         if not s:
             return jsonify({"reply": "🎯 No XP yet"})
         return jsonify({"reply": f"🎯 XP: {s['xp']}\n⭐ Level: {s['level']}"})
 
-    return jsonify({"reply": "Commands: start | status | stop | today | week | streak | score"})
+
+    return jsonify({"reply": "Commands: start | status | stop | today | week | streak | score | add task | tasks | done | clear tasks"})
 
 
 # ==========================================
