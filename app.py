@@ -1,6 +1,6 @@
-# ============================
-# PART 1 — Imports & Config
-# ============================
+# ============================================
+# PART 1 — Imports, Config, JSON Helpers
+# ============================================
 
 import os
 import threading
@@ -12,9 +12,10 @@ from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify
 import requests
 
-# =============================
+# ============================================
 # ENVIRONMENT VARIABLES
-# =============================
+# ============================================
+
 ZOHO_INCOMING_URL = os.getenv("ZOHO_INCOMING_URL")
 ZOHO_OAUTH_TOKEN = os.getenv("ZOHO_OAUTH_TOKEN")
 
@@ -24,9 +25,10 @@ REFRESH_TOKEN = os.getenv("REFRESH_TOKEN", "")
 
 LOCAL_TZ = ZoneInfo("Asia/Kolkata")
 
-# =============================
+# ============================================
 # JSON FILES
-# =============================
+# ============================================
+
 HISTORY_FILE = "history.json"
 SUMMARY_STATE_FILE = "summary_state.json"
 STREAK_FILE = "streaks.json"
@@ -38,9 +40,10 @@ timers = {}
 timers_lock = threading.Lock()
 
 
-# =============================
+# ============================================
 # FILE HELPERS
-# =============================
+# ============================================
+
 def load_file(path, default):
     try:
         with open(path, "r") as f:
@@ -48,11 +51,9 @@ def load_file(path, default):
     except:
         return default
 
-
 def save_file(path, data):
     with open(path, "w") as f:
         json.dump(data, f, indent=4)
-
 
 def load_history(): return load_file(HISTORY_FILE, [])
 def save_history(data): save_file(HISTORY_FILE, data)
@@ -70,11 +71,13 @@ def load_tasks(): return load_file(TASK_FILE, {})
 def save_tasks(data): save_file(TASK_FILE, data)
 
 
-# =============================
+# ============================================
 # TOKEN REFRESH
-# =============================
+# ============================================
+
 def refresh_access_token():
     global ZOHO_OAUTH_TOKEN
+
     if not (CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN):
         return False
 
@@ -83,7 +86,7 @@ def refresh_access_token():
         "refresh_token": REFRESH_TOKEN,
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
-        "grant_type": "refresh_token",
+        "grant_type": "refresh_token"
     }
 
     try:
@@ -98,11 +101,15 @@ def refresh_access_token():
     return False
 
 
-# =============================
-# SEND MESSAGE
-# =============================
+# ============================================
+# SEND MESSAGE TO ZOHO CLIQ
+# ============================================
+
 def send_message(text):
-    headers = {"Authorization": ZOHO_OAUTH_TOKEN, "Content-Type": "application/json"}
+    headers = {
+        "Authorization": ZOHO_OAUTH_TOKEN,
+        "Content-Type": "application/json"
+    }
 
     try:
         r = requests.post(ZOHO_INCOMING_URL, json={"text": text}, headers=headers)
@@ -118,9 +125,10 @@ def send_message(text):
         return None
 
 
-# =============================
+# ============================================
 # PARSE START COMMAND
-# =============================
+# ============================================
+
 def parse_start_command(text):
     parts = text.split()
     duration = 25
@@ -135,9 +143,10 @@ def parse_start_command(text):
     return duration, task
 
 
-# =============================
+# ============================================
 # STREAK SYSTEM
-# =============================
+# ============================================
+
 def update_streak_for_user(user_id):
     streaks = load_streaks()
 
@@ -166,9 +175,10 @@ def update_streak_for_user(user_id):
     return user["current_streak"], user["longest_streak"]
 
 
-# =============================
+# ============================================
 # XP / LEVEL SYSTEM
-# =============================
+# ============================================
+
 def calculate_level(xp):
     if xp < 100: return 1
     if xp < 250: return 2
@@ -176,17 +186,15 @@ def calculate_level(xp):
     if xp < 1000: return 4
     return xp // 500 + 4
 
-
 def update_score(user_id, duration, streak):
     scores = load_scores()
-
     user = scores.get(user_id, {"xp": 0, "level": 1})
 
     base_xp = duration
     streak_bonus = streak * 5
     long_bonus = 10 if duration >= 30 else 0
 
-    gained = base_xsum = base_xp + streak_bonus + long_bonus
+    gained = base_xp + streak_bonus + long_bonus
     user["xp"] += gained
     user["level"] = calculate_level(user["xp"])
 
@@ -196,9 +204,10 @@ def update_score(user_id, duration, streak):
     return gained, user["xp"], user["level"]
 
 
-# =============================
+# ============================================
 # COUNT TODAY'S POMODOROS
-# =============================
+# ============================================
+
 def count_pomodoros_today(user_id):
     today = datetime.utcnow().strftime("%Y-%m-%d")
     history = load_history()
@@ -206,26 +215,35 @@ def count_pomodoros_today(user_id):
     return sum(
         1 for h in history
         if h.get("user") == user_id and
-        h.get("date") == today and
-        h.get("type", "pomodoro") == "pomodoro"
+           h.get("date") == today and
+           h.get("type", "pomodoro") == "pomodoro"
     )
-# =============================
-# BREAK SYSTEM — MANUAL BREAK
-# =============================
+# ============================================
+# PART 2 — Break System, Timer Watcher & Threads
+# ============================================
+
+# -----------------------------
+# Start a manual break (pauses a running pomodoro if present)
+# -----------------------------
 def start_manual_break(user_id, minutes):
+    """
+    Starts a manual break for user_id.
+    If a pomodoro is running it will be paused and stored in paused_pomodoro.
+    """
+
     with timers_lock:
         current = timers.get(user_id)
         paused_pomodoro = None
 
-        # If pomodoro is running — pause it
+        # if a pomodoro is running, pause it
         if current and current.get("type") == "pomodoro":
             remaining = int(max((current["end"] - datetime.utcnow()).total_seconds(), 0))
             paused_pomodoro = {
-                "task": current["task"],
+                "task": current.get("task"),
                 "remaining_seconds": remaining
             }
 
-        # Start break timer
+        # start/override break timer
         end_time = datetime.utcnow() + timedelta(minutes=minutes)
         timers[user_id] = {
             "type": "break",
@@ -235,70 +253,79 @@ def start_manual_break(user_id, minutes):
             "paused_pomodoro": paused_pomodoro
         }
 
-    send_message(f"☕ Break started for {minutes} minutes. (Use `stop break` to resume work.)")
+    # notify user
+    send_message(f"☕ Break started for {minutes} minutes. (Type `stop break` to cancel and resume.)")
     return True
 
 
-# =============================
-# STOP BREAK
-# =============================
+# -----------------------------
+# Stop an active break (resumes paused pomodoro if any)
+# -----------------------------
 def stop_break(user_id):
+    """
+    Stops the current break for user_id.
+    If a paused pomodoro exists it will be resumed.
+    Returns (ok:bool, message:str)
+    """
     with timers_lock:
         current = timers.get(user_id)
-
         if not current or current.get("type") != "break":
             return False, "❌ No active break to stop."
 
         paused = current.get("paused_pomodoro")
+        # remove current break
         timers.pop(user_id, None)
 
-        # Resume paused pomodoro
         if paused:
-            remaining = paused["remaining_seconds"]
+            remaining = paused.get("remaining_seconds", 0)
             new_end = datetime.utcnow() + timedelta(seconds=remaining)
-
             timers[user_id] = {
                 "type": "pomodoro",
                 "end": new_end,
-                "task": paused["task"],
+                "task": paused.get("task"),
                 "duration": round(remaining / 60, 2),
                 "paused_pomodoro": None
             }
+            return True, f"▶️ Break stopped. Resumed **{paused.get('task')}** with {remaining//60}m {remaining%60}s left."
+        else:
+            return True, "🛑 Break stopped."
 
-            return True, f"▶️ Resumed **{paused['task']}** with {remaining//60}m {remaining%60}s left."
 
-        return True, "🛑 Break stopped."
-
-
-# =============================
-# TIMER WATCHER THREAD
-# =============================
+# -----------------------------
+# TIMER WATCHER (runs in background)
+# -----------------------------
 def timer_watcher():
-    print("⏳ Timer watcher started.")
-
+    """
+    Background thread that checks timers every second,
+    processes completed pomodoros and breaks, updates history,
+    streaks, scores, and starts auto-breaks / resumes paused pomodoros.
+    """
+    print("⏳ Timer watcher thread started.")
     while True:
         now = datetime.utcnow()
-        completed = []
+        to_process = []
 
-        # CHECK FINISHED TIMERS
+        # collect expired timers
         with timers_lock:
             for uid, info in list(timers.items()):
-                if now >= info["end"]:
-                    completed.append((uid, info))
+                try:
+                    if now >= info.get("end"):
+                        to_process.append((uid, info))
+                except Exception:
+                    # malformed timer entry - remove it
+                    timers.pop(uid, None)
 
-        # PROCESS FINISHED TIMERS
-        for uid, info in completed:
+        # process each expired timer outside lock
+        for uid, info in to_process:
             try:
-                timer_type = info.get("type")
+                ttype = info.get("type", "pomodoro")
 
-                # -------------------------------------
-                # POMODORO FINISHED
-                # -------------------------------------
-                if timer_type == "pomodoro":
-                    task = info["task"]
-                    duration = info["duration"]
+                # ---------- POMODORO COMPLETED ----------
+                if ttype == "pomodoro":
+                    task = info.get("task", "Untitled Task")
+                    duration = info.get("duration", 25)
 
-                    # Save to history
+                    # append history entry
                     history = load_history()
                     history.append({
                         "user": uid,
@@ -310,123 +337,106 @@ def timer_watcher():
                     })
                     save_history(history)
 
-                    # Update streak + score
-                    current, longest = update_streak_for_user(uid)
-                    gained, total_xp, level = update_score(uid, duration, current)
+                    # update streak and score
+                    current_streak, longest = update_streak_for_user(uid)
+                    gained, total_xp, level = update_score(uid, duration, current_streak)
 
-                    # Completion message
+                    # notify completion
                     send_message(
-                        f"⏰ Pomodoro Completed!\n"
-                        f"✔ **{task}** ({duration} min)\n\n"
-                        f"🔥 Streak: {current} days\n"
-                        f"🏆 Longest: {longest} days\n\n"
-                        f"🎯 XP: +{gained}\n"
+                        f"⏰ Pomodoro completed!\n"
+                        f"✔ Task: **{task}** ({duration} min)\n\n"
+                        f"🔥 Streak: {current_streak} days\n"
+                        f"🏆 Longest streak: {longest} days\n\n"
+                        f"🎯 XP earned: +{gained}\n"
                         f"💠 Total XP: {total_xp}\n"
                         f"⭐ Level: {level}"
                     )
 
-                    # -----------------------
-                    # AUTO BREAK STARTS HERE
-                    # -----------------------
+                    # AUTO-BREAK logic: short/long break
                     completed_today = count_pomodoros_today(uid)
-
-                    auto_break_min = 15 if completed_today % 4 == 0 else 5
-
-                    break_end = datetime.utcnow() + timedelta(minutes=auto_break_min)
+                    # long break after every 4 pomodoros in a day
+                    auto_break_min = 15 if (completed_today % 4 == 0) else 5
 
                     with timers_lock:
                         timers[uid] = {
                             "type": "break",
-                            "end": break_end,
+                            "end": datetime.utcnow() + timedelta(minutes=auto_break_min),
                             "task": f"Auto Break ({auto_break_min} min)",
                             "duration": auto_break_min,
                             "paused_pomodoro": None
                         }
 
-                    send_message(
-                        f"☕ Auto-break started for {auto_break_min} minutes.\n"
-                        f"(Type `stop break` to skip or `break <min>` to override.)"
-                    )
+                    send_message(f"☕ Auto-break started for {auto_break_min} minutes. (Type `stop break` to cancel or `break <min>` to override.)")
 
-                # -------------------------------------
-                # BREAK FINISHED
-                # -------------------------------------
-                elif timer_type == "break":
-                    break_task = info["task"]
-                    duration = info["duration"]
+                # ---------- BREAK COMPLETED ----------
+                elif ttype == "break":
+                    br_task = info.get("task", "Break")
+                    br_duration = info.get("duration", 5)
                     paused = info.get("paused_pomodoro")
 
-                    # Save break to history
+                    # save break history
                     history = load_history()
                     history.append({
                         "user": uid,
-                        "task": break_task,
-                        "duration": duration,
+                        "task": br_task,
+                        "duration": br_duration,
                         "completed_at": datetime.utcnow().isoformat(),
                         "date": datetime.utcnow().strftime("%Y-%m-%d"),
                         "type": "break"
                     })
                     save_history(history)
 
+                    # if a pomodoro was paused, resume it
                     if paused:
-                        # Resume paused pomodoro
-                        remaining = paused["remaining_seconds"]
+                        remaining = paused.get("remaining_seconds", 0)
                         new_end = datetime.utcnow() + timedelta(seconds=remaining)
-
                         with timers_lock:
                             timers[uid] = {
                                 "type": "pomodoro",
                                 "end": new_end,
-                                "task": paused["task"],
+                                "task": paused.get("task"),
                                 "duration": round(remaining / 60, 2),
                                 "paused_pomodoro": None
                             }
-
-                        send_message(
-                            f"⏰ Break over — Resuming **{paused['task']}** "
-                            f"({remaining//60}m {remaining%60}s left)"
-                        )
+                        send_message(f"⏰ Break over — resuming **{paused.get('task')}** with {remaining//60}m {remaining%60}s left.")
                     else:
-                        send_message("☕ Break over! Ready for your next session.")
-
-                        # Suggest next task
+                        send_message("☕ Break over! Ready to get back to work.")
+                        # suggest next queued task if available
                         tasks = load_tasks()
                         user_tasks = tasks.get(uid, [])
-
                         if user_tasks:
                             next_task = user_tasks[0]
-                            send_message(
-                                f"⏭ Next task: **{next_task['task']}** "
-                                f"({next_task['duration']} min)\n"
-                                f"Type `start next` to begin."
-                            )
+                            send_message(f"⏭ Next task in queue: **{next_task['task']}** ({next_task['duration']} min). Type `start next` to continue.")
 
-                # -------------------------------------
-                # Remove processed timer
-                # -------------------------------------
+                # After processing, remove timer if it wasn't replaced by a resume
                 with timers_lock:
-                    current = timers.get(uid)
-                    if current and current["end"] == info["end"]:
-                        timers.pop(uid, None)
+                    cur = timers.get(uid)
+                    # compare by "end" datetimes (they are datetime objects)
+                    if cur is None:
+                        pass
+                    else:
+                        # if same end as processed info then remove it (processed)
+                        if cur.get("end") == info.get("end") and cur.get("type") == info.get("type"):
+                            timers.pop(uid, None)
 
             except Exception as e:
-                print("⚠️ Timer error:", e)
+                print("⚠️ Error processing timer for user", uid, ":", e)
 
         time.sleep(1)
 
 
-# =============================
-# BACKGROUND THREAD STARTER
-# =============================
+# -----------------------------
+# Start background threads on first request
+# -----------------------------
 @app.before_request
 def start_threads():
-    if not getattr(app, "started", False):
+    if not getattr(app, "threads_started", False):
         threading.Thread(target=timer_watcher, daemon=True).start()
-        app.started = True
-        print("🚀 Background threads started.")
-# =============================
-# PART 3 — Routes, Weekly Chart, Run
-# =============================
+        app.threads_started = True
+        print("🚀 Background threads started (timer watcher).")
+# ============================================
+# PART 3 — Routes: /pomodoro, weekly chart, summaries
+# ============================================
 
 # -----------------------------
 # Weekly Analytics Chart (Combined: count + minutes)
@@ -436,23 +446,24 @@ def get_weekly_chart(user_id):
     if not history:
         return "📭 No history available."
 
-    # Days mapping Mon..Sun
     days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     weekly = {d: {"count": 0, "minutes": 0} for d in days}
 
     for h in history:
         if h.get("user") != user_id:
             continue
+        # parse completed_at safely
         try:
             dt = datetime.fromisoformat(h.get("completed_at"))
         except Exception:
-            # fallback: use now date if parsing fails
-            dt = datetime.strptime(h.get("date"), "%Y-%m-%d") if h.get("date") else datetime.utcnow()
+            try:
+                dt = datetime.strptime(h.get("date"), "%Y-%m-%d")
+            except Exception:
+                dt = datetime.utcnow()
         weekday = days[dt.weekday()]
         weekly[weekday]["count"] += 1
         weekly[weekday]["minutes"] += int(h.get("duration", 0))
 
-    # Build chart with bars proportional to counts (one '█' per session)
     out = "📊 **WEEKLY ANALYTICS**\n\n"
     total_sessions = 0
     total_minutes = 0
@@ -479,14 +490,14 @@ def get_weekly_chart(user_id):
 
 
 # -----------------------------
-# Helper: Today summary (already used elsewhere) kept as simple wrapper
+# Today summary wrapper (uses existing build_daily_summary)
 # -----------------------------
 def build_today_summary(user_id):
     return build_daily_summary(user_id)
 
 
 # -----------------------------
-# Bot endpoint — all commands
+# /pomodoro route (all commands)
 # -----------------------------
 @app.route("/pomodoro", methods=["POST"])
 def pomodoro_route():
@@ -629,7 +640,7 @@ def pomodoro_route():
     if msg == "today":
         return jsonify({"reply": build_today_summary(user)})
 
-    # ---- Weekly summary (simple count per date) ----
+    # ---- Weekly summary (simple) ----
     if msg == "week":
         history = load_history()
         user_hist = [h for h in history if h.get("user") == user]
@@ -643,7 +654,7 @@ def pomodoro_route():
             out += f"{d}: {'🍅'*c} ({c})\n"
         return jsonify({"reply": out})
 
-    # ---- Weekly analytics chart (ASCII combined) ----
+    # ---- Weekly analytics chart ----
     if msg in ("chart", "weekly chart", "analytics", "weekly analytics"):
         chart_text = get_weekly_chart(user)
         return jsonify({"reply": chart_text})
@@ -666,29 +677,211 @@ def pomodoro_route():
 
     # ---- Help / fallback ----
     return jsonify({"reply": "Commands: start | break | stop break | resume | status | stop | today | week | chart | streak | score | add task | tasks | start next | done | clear tasks"})
-    
+# ============================================
+# PART 4 — PDF EXPORT + DOWNLOAD ROUTE + export handler
+# ============================================
+
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import inch
+
+# Ensure reports directory exists
+REPORT_DIR = "reports"
+if not os.path.exists(REPORT_DIR):
+    os.makedirs(REPORT_DIR)
+
 
 # -----------------------------
-# Root endpoint
+# Helper: create PDF
 # -----------------------------
-@app.route("/")
-def home():
-    return "Pomodoro Bot Running"
+def create_pdf(filepath, title, lines):
+    c = canvas.Canvas(filepath, pagesize=A4)
+    width, height = A4
+
+    # title
+    c.setFont("Helvetica-Bold", 20)
+    c.drawString(50, height - 80, title)
+
+    # body
+    c.setFont("Helvetica", 12)
+    y = height - 120
+
+    for line in lines:
+        if y < 50:   # page break
+            c.showPage()
+            c.setFont("Helvetica", 12)
+            y = height - 50
+        c.drawString(50, y, line)
+        y -= 20
+
+    c.save()
 
 
 # -----------------------------
-# Run server
+# DAILY REPORT
+# -----------------------------
+def generate_daily_report(user_id):
+    history = load_history()
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    entries = [
+        h for h in history
+        if h.get("user") == user_id and h.get("date") == today
+    ]
+
+    filepath = f"{REPORT_DIR}/daily_{user_id}.pdf"
+    lines = []
+    total = 0
+
+    if not entries:
+        lines.append("No activity today.")
+    else:
+        lines.append("Today's Pomodoro Activity:\n")
+        for h in entries:
+            t = h.get("task", "")
+            d = h.get("duration", 0)
+            tt = h.get("type", "pomodoro")
+            lines.append(f"- {t} ({d} min, {tt})")
+            if tt == "pomodoro":
+                total += d
+        lines.append("")
+        lines.append(f"Total Focus Time: {total} min")
+
+    create_pdf(filepath, "Daily Report", lines)
+    return filepath
+
+
+# -----------------------------
+# WEEKLY REPORT
+# -----------------------------
+def generate_weekly_report(user_id):
+    history = load_history()
+    today = datetime.utcnow()
+    start = today - timedelta(days=7)
+
+    entries = [
+        h for h in history
+        if h.get("user") == user_id and datetime.fromisoformat(h.get("completed_at")) >= start
+    ]
+
+    filepath = f"{REPORT_DIR}/weekly_{user_id}.pdf"
+    lines = []
+    total = 0
+
+    if not entries:
+        lines.append("No activity in last 7 days.")
+    else:
+        lines.append("Weekly Pomodoro Activity:\n")
+        for h in entries:
+            date = h.get("date")
+            t = h.get("task")
+            d = h.get("duration", 0)
+            tt = h.get("type")
+            lines.append(f"{date}: {t} ({d} min, {tt})")
+            if tt == "pomodoro":
+                total += d
+
+        lines.append("")
+        lines.append(f"Total Focus Time (7 days): {total} min")
+
+    create_pdf(filepath, "Weekly Report", lines)
+    return filepath
+
+
+# -----------------------------
+# MONTHLY REPORT
+# -----------------------------
+def generate_monthly_report(user_id):
+    history = load_history()
+    today = datetime.utcnow()
+    start = today - timedelta(days=30)
+
+    entries = [
+        h for h in history
+        if h.get("user") == user_id and datetime.fromisoformat(h.get("completed_at")) >= start
+    ]
+
+    filepath = f"{REPORT_DIR}/monthly_{user_id}.pdf"
+    lines = []
+    total = 0
+    p_count = 0
+    b_count = 0
+
+    if not entries:
+        lines.append("No activity in last 30 days.")
+    else:
+        lines.append("Monthly Pomodoro Activity:\n")
+        for h in entries:
+            date = h.get("date")
+            t = h.get("task")
+            d = h.get("duration")
+            tt = h.get("type")
+            lines.append(f"{date}: {t} ({d} min, {tt})")
+            if tt == "pomodoro":
+                p_count += 1
+                total += d
+            else:
+                b_count += 1
+
+        lines.append("")
+        lines.append(f"Pomodoro Sessions: {p_count}")
+        lines.append(f"Break Sessions: {b_count}")
+        lines.append(f"Total Focus Time: {total} min")
+
+    create_pdf(filepath, "Monthly Report", lines)
+    return filepath
+
+
+# -----------------------------
+# PUBLIC PDF DOWNLOAD ENDPOINT
+# -----------------------------
+@app.route("/download/<path:filename>")
+def download_report(filename):
+    filepath = os.path.join(REPORT_DIR, filename)
+    if not os.path.exists(filepath):
+        return "❌ File not found.", 404
+
+    from flask import send_file
+    return send_file(filepath, as_attachment=True)
+
+
+# -----------------------------
+# EXPORT COMMAND ENDPOINT
+# -----------------------------
+@app.route("/export", methods=["POST"])
+def export_route():
+    data = request.json or {}
+    raw = data.get("raw", "")
+    msg = raw.lower().strip()
+    user = data.get("user")
+
+    if not user:
+        return jsonify({"reply": "❌ Missing user id."}), 400
+
+    # DAILY
+    if msg in ("export today", "export daily"):
+        filepath = generate_daily_report(user)
+        link = request.host_url + "download/" + os.path.basename(filepath)
+        return jsonify({"reply": f"📄 Daily Report Ready!\nDownload: {link}"})
+
+    # WEEKLY
+    if msg in ("export week", "export weekly"):
+        filepath = generate_weekly_report(user)
+        link = request.host_url + "download/" + os.path.basename(filepath)
+        return jsonify({"reply": f"📄 Weekly Report Ready!\nDownload: {link}"})
+
+    # MONTHLY
+    if msg in ("export month", "export monthly"):
+        filepath = generate_monthly_report(user)
+        link = request.host_url + "download/" + os.path.basename(filepath)
+        return jsonify({"reply": f"📄 Monthly Report Ready!\nDownload: {link}"})
+
+    return jsonify({"reply": "❌ Use one of:\nexport today | export week | export month"})
+
+
+# -----------------------------
+# RUN (for local testing)
+# Render/Railway uses Gunicorn, so this is safe.
 # -----------------------------
 if __name__ == "__main__":
-    # ensure JSON files exist to prevent crashes
-    for fn, init in [
-        (HISTORY_FILE, []),
-        (SUMMARY_STATE_FILE, {}),
-        (STREAK_FILE, {}),
-        (SCORE_FILE, {}),
-        (TASK_FILE, {})
-    ]:
-        if not os.path.exists(fn):
-            save_file(fn, init)
-
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    app.run(host="0.0.0.0", port=5000)
