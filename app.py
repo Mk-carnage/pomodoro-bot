@@ -577,12 +577,7 @@ def pomodoro_route():
     # ---- Manual break ----
     if msg.startswith("break"):
         parts = raw.split()
-        if len(parts) == 1:
-            minutes = 5
-        elif len(parts) == 2 and parts[1].isdigit():
-            minutes = int(parts[1])
-        else:
-            return jsonify({"reply": "Usage: break OR break <minutes>"})
+        minutes = 5 if len(parts) == 1 else int(parts[1])
         start_manual_break(user, minutes)
         return jsonify({"reply": f"☕ Break started for {minutes} minutes."})
 
@@ -598,7 +593,6 @@ def pomodoro_route():
         with timers_lock:
             cur = timers.get(user)
             if cur and cur.get("type") == "break":
-                # user wants to start pomodoro during break — cancel break and start pomodoro
                 timers.pop(user, None)
             timers[user] = {"type": "pomodoro", "end": end, "task": task_name, "duration": duration, "paused_pomodoro": None}
         return jsonify({"reply": f"🍅 Started **{task_name}** ({duration} min)"})
@@ -610,13 +604,13 @@ def pomodoro_route():
             if not cur:
                 return jsonify({"reply": "❌ No active session."})
             remaining = int(max((cur["end"] - datetime.utcnow()).total_seconds(), 0))
-            ttype = cur.get("type", "pomodoro")
+            ttype = cur.get("type")
             if ttype == "pomodoro":
                 return jsonify({"reply": f"🍅 {cur['task']} — {remaining//60}m {remaining%60}s left"})
             else:
                 return jsonify({"reply": f"☕ Break — {remaining//60}m {remaining%60}s left"})
 
-    # ---- Stop / Cancel ----
+    # ---- Stop session ----
     if msg in ("stop", "end", "cancel"):
         with timers_lock:
             if user in timers:
@@ -624,7 +618,7 @@ def pomodoro_route():
                 return jsonify({"reply": "🛑 Stopped."})
         return jsonify({"reply": "❌ No active session."})
 
-    # ---- Resume (for paused pomodoro during break) ----
+    # ---- Resume ----
     if msg == "resume":
         with timers_lock:
             cur = timers.get(user)
@@ -633,14 +627,14 @@ def pomodoro_route():
                 remaining = paused.get("remaining_seconds", 0)
                 end = datetime.utcnow() + timedelta(seconds=remaining)
                 timers[user] = {"type": "pomodoro", "end": end, "task": paused.get("task"), "duration": round(remaining / 60, 2), "paused_pomodoro": None}
-                return jsonify({"reply": f"⏯ Resumed **{paused.get('task')}** with {remaining//60}m {remaining%60}s left."})
+                return jsonify({"reply": f"⏯ Resumed **{paused.get('task')}**"})
         return jsonify({"reply": "❌ Nothing to resume."})
 
     # ---- Today summary ----
     if msg == "today":
         return jsonify({"reply": build_today_summary(user)})
 
-    # ---- Weekly summary (simple) ----
+    # ---- Week summary ----
     if msg == "week":
         history = load_history()
         user_hist = [h for h in history if h.get("user") == user]
@@ -675,8 +669,28 @@ def pomodoro_route():
             return jsonify({"reply": "🎯 No XP yet"})
         return jsonify({"reply": f"🎯 XP: {s['xp']}\n⭐ Level: {s['level']}"})
 
-    # ---- Help / fallback ----
-    return jsonify({"reply": "Commands: start | break | stop break | resume | status | stop | today | week | chart | streak | score | add task | tasks | start next | done | clear tasks"})
+    # ---- Export Commands ----
+    if msg.startswith("export"):
+        if msg in ("export today", "export daily"):
+            filepath = generate_daily_report(user)
+            link = request.host_url + "download/" + os.path.basename(filepath)
+            return jsonify({"reply": f"📄 Daily Report Ready!\nDownload: {link}"})
+
+        if msg in ("export week", "export weekly"):
+            filepath = generate_weekly_report(user)
+            link = request.host_url + "download/" + os.path.basename(filepath)
+            return jsonify({"reply": f"📄 Weekly Report Ready!\nDownload: {link}"})
+
+        if msg in ("export month", "export monthly"):
+            filepath = generate_monthly_report(user)
+            link = request.host_url + "download/" + os.path.basename(filepath)
+            return jsonify({"reply": f"📄 Monthly Report Ready!\nDownload: {link}"})
+
+        return jsonify({"reply": "❌ Use: export today | export week | export month"})
+
+    # ---- Help ----
+    return jsonify({"reply": "Commands: start | break | stop break | resume | status | stop | today | week | chart | streak | score | add task | tasks | start next | done | clear tasks | export today | export week | export month"})
+
 # ============================================
 # PART 4 — PDF EXPORT + DOWNLOAD ROUTE + export handler
 # ============================================
