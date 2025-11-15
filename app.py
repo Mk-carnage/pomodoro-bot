@@ -438,14 +438,12 @@ def home():
 
 @app.before_request
 def start_threads():
-    # Only trigger threads for /pomodoro POST requests
-    if request.path != "/pomodoro":
-        return
-
+    # Start on both / (uptime ping) and /pomodoro only once
     if not getattr(app, "threads_started", False):
         threading.Thread(target=timer_watcher, daemon=True).start()
         app.threads_started = True
         print("🚀 Background threads started (timer watcher).")
+
 
 
 # ============================================
