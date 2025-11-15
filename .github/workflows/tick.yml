@@ -8,10 +8,9 @@ on:
 jobs:
   tick:
     runs-on: ubuntu-latest
-
     steps:
       - name: Ping Tick Endpoint
         run: |
           curl -X GET "https://pomodoro-bot-dbmb.onrender.com/tick" \
-            -H "User-Agent: GitHubActionsCron" \
-            --silent --show-error
+          -H "User-Agent: GitHubActionsCron" \
+          --silent --show-error
