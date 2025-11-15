@@ -236,26 +236,31 @@ def save_user_stats(user_id, stats):
 # ---------------------------
 def refresh_access_token():
     global ZOHO_OAUTH_TOKEN
-    if not (CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN):
-        return False
+
     url = "https://accounts.zoho.com/oauth/v2/token"
-    params = {
+    payload = {
         "refresh_token": REFRESH_TOKEN,
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
         "grant_type": "refresh_token"
     }
+
     try:
-        r = requests.post(url, params=params, timeout=10).json()
-        if "access_token" in r:
-            ZOHO_OAUTH_TOKEN = "Zoho-oauthtoken " + r["access_token"]
-            print("🔄 Refreshed Zoho Access Token.")
+        r = requests.post(url, data=payload, timeout=10)
+        data = r.json()
+
+        if "access_token" in data:
+            ZOHO_OAUTH_TOKEN = "Zoho-oauthtoken " + data["access_token"]
+            print("🔄 Access token refreshed.")
             return True
         else:
-            print("refresh token error:", r)
+            print("❌ Refresh token error:", data)
+            return False
+
     except Exception as e:
-        print("refresh_access_token exception:", e)
-    return False
+        print("❌ Exception refreshing token:", e)
+        return False
+
 
 def send_message(text):
     headers = {"Authorization": ZOHO_OAUTH_TOKEN, "Content-Type": "application/json"}
