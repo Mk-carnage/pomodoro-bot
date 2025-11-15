@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from flask import Flask, request, jsonify, send_file, abort
+from flask import Flask, request, jsonify, send_file
 import requests
 from pymongo import MongoClient, ReturnDocument
 
@@ -14,7 +14,6 @@ from pymongo import MongoClient, ReturnDocument
 try:
     from reportlab.pdfgen import canvas
     from reportlab.lib.pagesizes import A4
-    from reportlab.lib.units import inch
     REPORTLAB_AVAILABLE = True
 except Exception:
     REPORTLAB_AVAILABLE = False
@@ -25,11 +24,16 @@ except Exception:
 MONGO_URI = os.getenv("MONGO_URI", "")
 MONGO_DB = os.getenv("MONGO_DB", "pomodoro_db")
 
-ZOHO_INCOMING_URL = os.getenv("ZOHO_INCOMING_URL", "")
-ZOHO_OAUTH_TOKEN = os.getenv("ZOHO_OAUTH_TOKEN", "")  # format: "Zoho-oauthtoken xxxxx"
+# Must be the bot incoming URL you confirmed
+ZOHO_INCOMING_URL = os.getenv("ZOHO_INCOMING_URL", "https://cliq.zoho.com/api/v2/bots/pomodorobot/incoming")
+
+# OAuth envs (server-based client)
 CLIENT_ID = os.getenv("CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")
 REFRESH_TOKEN = os.getenv("REFRESH_TOKEN", "")
+
+# Access token (populated at runtime)
+ZOHO_OAUTH_TOKEN = ""  # "Zoho-oauthtoken xxxxx"
 
 LOCAL_TZ_NAME = os.getenv("LOCAL_TZ", "Asia/Kolkata")
 try:
@@ -53,79 +57,25 @@ col_history = db.get_collection("history")    # all completed sessions
 col_tasks = db.get_collection("tasks")        # queued tasks per user
 col_users = db.get_collection("users")        # streaks, scores, meta
 
-# Create indexes (optional)
-col_timers.create_index("user", unique=True)
+# Create indexes (optional, ignore if exists)
+try:
+    col_timers.create_index("user", unique=True)
+except Exception:
+    pass
 
 # ---------------------------
-# In-memory structures
+# In-memory structures & locks
 # ---------------------------
 app = Flask(__name__)
 timers = {}  # user_id -> timer dict (end as datetime aware UTC)
 timers_lock = threading.Lock()
 
+# OAuth token tracking
+ACCESS_TOKEN_ISSUED_AT = 0.0
+TOKEN_LIFETIME = 3600  # seconds - Zoho standard
+TOKEN_REFRESH_THRESHOLD = 50 * 60  # 50 minutes
 
-
-# ---------------------------
-# OAuth: Callback + Token Exchange
-# ---------------------------
-
-@app.route("/oauth/callback")
-def oauth_callback():
-    """
-    Zoho redirects here after user accepts.
-    This endpoint only displays the `code` so you can exchange it.
-    """
-    code = request.args.get("code")
-    if not code:
-        return "❌ No authorization code received.", 400
-
-    return f"""
-        <h2>✅ Authorization Code Received</h2>
-        <p>Copy this code and use it in /oauth/exchange:</p>
-        <pre style='padding:10px;border:1px solid #ccc;background:#f7f7f7;'>{code}</pre>
-    """, 200
-
-
-@app.route("/oauth/exchange", methods=["POST"])
-def oauth_exchange():
-    """
-    Convert authorization code → access_token + refresh_token
-    """
-    code = request.json.get("code")
-    if not code:
-        return jsonify({"error": "Missing 'code' field"}), 400
-
-    # Use your existing CLIENT_ID, CLIENT_SECRET, and redirect URI
-    TOKEN_URL = "https://accounts.zoho.com/oauth/v2/token"
-
-    payload = {
-        "grant_type": "authorization_code",
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "redirect_uri": "https://pomodoro-bot-dbmb.onrender.com/oauth/callback",
-        "code": code
-    }
-
-    try:
-        r = requests.post(TOKEN_URL, data=payload)
-        response_data = r.json()
-
-        # If refresh_token exists, show friendly message
-        if "refresh_token" in response_data:
-            return jsonify({
-                "status": "success",
-                "message": "🎉 Refresh token generated successfully!",
-                "refresh_token": response_data["refresh_token"],
-                "access_token": response_data.get("access_token")
-            })
-
-        return jsonify(response_data)
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-
+token_refresh_lock = threading.Lock()
 
 # ---------------------------
 # Helpers: datetime <-> iso (UTC)
@@ -158,14 +108,10 @@ def dt_to_iso(dt):
 # Persistence helpers (timers)
 # ---------------------------
 def set_active_timer(user_id, timer_obj):
-    """
-    upsert active timer into MongoDB. timer_obj expects 'end' as ISO string or datetime.
-    """
     doc = timer_obj.copy()
     end = doc.get("end")
     if isinstance(end, datetime):
         doc["end"] = dt_to_iso(end)
-    # store entire doc as-is
     col_timers.find_one_and_update(
         {"user": user_id},
         {"$set": {**doc, "user": user_id}},
@@ -180,9 +126,6 @@ def get_active_timer_from_db(user_id):
     return col_timers.find_one({"user": user_id})
 
 def rehydrate_timers():
-    """
-    Load timers from DB into in-memory timers (convert end to datetime).
-    """
     docs = list(col_timers.find({}))
     with timers_lock:
         timers.clear()
@@ -205,7 +148,6 @@ def rehydrate_timers():
 # Other persistence helpers: history, tasks, users
 # ---------------------------
 def append_history(item):
-    # item should contain: user, task, duration, completed_at (ISO), date, type
     col_history.insert_one(item)
 
 def load_tasks_for_user(user_id):
@@ -219,7 +161,6 @@ def load_user_stats(user_id):
     doc = col_users.find_one({"user": user_id})
     if not doc:
         return {"xp": 0, "level": 1, "current_streak": 0, "longest_streak": 0, "last_completed_date": None}
-    # ensure keys exist
     return {
         "xp": doc.get("xp", 0),
         "level": doc.get("level", 1),
@@ -232,79 +173,130 @@ def save_user_stats(user_id, stats):
     col_users.find_one_and_update({"user": user_id}, {"$set": stats}, upsert=True)
 
 # ---------------------------
-# Zoho token refresh + send message
+# Zoho token refresh + send message (robust)
 # ---------------------------
-def refresh_access_token():
-    global ZOHO_OAUTH_TOKEN
+def refresh_access_token(force=False):
+    """
+    Refresh access token using permanent REFRESH_TOKEN.
+    token_refresh_lock prevents concurrent refreshes.
+    Returns True on success (and sets ZOHO_OAUTH_TOKEN + ACCESS_TOKEN_ISSUED_AT).
+    """
+    global ZOHO_OAUTH_TOKEN, ACCESS_TOKEN_ISSUED_AT
 
-    url = "https://accounts.zoho.com/oauth/v2/token"
-    payload = {
-        "refresh_token": REFRESH_TOKEN,
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "grant_type": "refresh_token"
-    }
+    # quick check: if not forcing and token is fresh enough, skip
+    now = time.time()
+    if not force and ACCESS_TOKEN_ISSUED_AT and (now - ACCESS_TOKEN_ISSUED_AT) < TOKEN_REFRESH_THRESHOLD:
+        return True
 
-    try:
-        r = requests.post(url, data=payload, timeout=10)
-        data = r.json()
-
-        if "access_token" in data:
-            ZOHO_OAUTH_TOKEN = "Zoho-oauthtoken " + data["access_token"]
-            print("🔄 Access token refreshed.")
+    # single refresh at a time
+    with token_refresh_lock:
+        # re-check inside lock
+        now = time.time()
+        if not force and ACCESS_TOKEN_ISSUED_AT and (now - ACCESS_TOKEN_ISSUED_AT) < TOKEN_REFRESH_THRESHOLD:
             return True
-        else:
-            print("❌ Refresh token error:", data)
+
+        if not (CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN):
+            print("❌ OAuth env missing (CLIENT_ID/CLIENT_SECRET/REFRESH_TOKEN)")
             return False
 
-    except Exception as e:
-        print("❌ Exception refreshing token:", e)
-        return False
+        url = "https://accounts.zoho.com/oauth/v2/token"
+        payload = {
+            "refresh_token": REFRESH_TOKEN,
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "grant_type": "refresh_token"
+        }
+        try:
+            r = requests.post(url, data=payload, timeout=10)
+            data = r.json()
+            if "access_token" in data:
+                ZOHO_OAUTH_TOKEN = "Zoho-oauthtoken " + data["access_token"]
+                ACCESS_TOKEN_ISSUED_AT = time.time()
+                print("🔄 Access token refreshed (at {}).".format(datetime.utcnow().isoformat()))
+                return True
+            else:
+                print("❌ Refresh token error:", data)
+                return False
+        except Exception as e:
+            print("❌ Exception refreshing token:", e)
+            return False
 
-
-def send_message(text):
-    headers = {"Authorization": ZOHO_OAUTH_TOKEN, "Content-Type": "application/json"}
-    try:
-        r = requests.post(ZOHO_INCOMING_URL, json={"text": text}, headers=headers, timeout=10)
-        if r.status_code == 401:
-            # try refresh once
-            if refresh_access_token():
-                headers["Authorization"] = ZOHO_OAUTH_TOKEN
-                r = requests.post(ZOHO_INCOMING_URL, json={"text": text}, headers=headers, timeout=10)
-        return r
-    except Exception as e:
-        print("send_message error:", e)
+def send_message(text, max_retries=1):
+    """
+    Sends a plain text message through bot incoming webhook.
+    Ensures token is sufficiently fresh before send, retries on 401 or explicit invalid_oauth text.
+    """
+    # Ensure token present and fresh
+    if not refresh_access_token():
+        print("❌ Cannot refresh access token before sending message.")
         return None
+
+    headers = {"Authorization": ZOHO_OAUTH_TOKEN, "Content-Type": "application/json"}
+    payload = {"text": text}
+
+    attempt = 0
+    while attempt <= max_retries:
+        attempt += 1
+        try:
+            r = requests.post(ZOHO_INCOMING_URL, json=payload, headers=headers, timeout=10)
+        except Exception as e:
+            print("send_message request exception:", e)
+            r = None
+
+        if r is None:
+            # try once more after tiny wait
+            time.sleep(0.5)
+            continue
+
+        # If successful (200 or 201), return the response
+        if r.status_code in (200, 201, 204):
+            # debug log
+            try:
+                print(f"📤 Message sent (status {r.status_code}): {text[:120]}")
+            except Exception:
+                pass
+            return r
+
+        # If unauthorized, refresh and retry
+        text_lower = (r.text or "").lower()
+        if r.status_code == 401 or "invalid_oauth" in text_lower or "invalid token" in text_lower:
+            print("⚠️ Received unauthorized response from Zoho, attempting token refresh and retry.")
+            if refresh_access_token(force=True):
+                headers["Authorization"] = ZOHO_OAUTH_TOKEN
+                # small backoff
+                time.sleep(0.5)
+                continue
+            else:
+                print("❌ Refresh failed after 401 during send_message.")
+                return r
+
+        # For other 4xx/5xx, do not retry more than once
+        print("⚠️ Zoho responded with status:", r.status_code, "body:", r.text)
+        return r
+
+    return None
 
 # ---------------------------
 # Utility: parse incoming payload (compat with Deluge/form)
 # ---------------------------
 def parse_incoming_request(data):
-    """
-    Accept many possible payload shapes from Deluge/Zoho.
-    - raw text fields: 'raw', 'message', 'msg', 'text', 'raw_message', 'raw_msg', 'raw'
-    - user id fields: 'user', 'user_id', or 'user' map with 'id'
-    Returns (user_id, raw_text)
-    """
     if not isinstance(data, dict):
         return None, ""
 
     # find text
+    text = ""
     for key in ("raw", "message", "msg", "text", "raw_message", "raw_msg", "message_details", "rawMessage"):
         v = data.get(key)
         if isinstance(v, str) and v.strip():
             text = v.strip()
             break
-    else:
-        # sometimes body passed as {"message": {"raw_message": "..."}}
-        text = ""
-        # deeper checks
-        if "message_details" in data and isinstance(data["message_details"], dict):
-            for k in ("raw_message", "message", "msg"):
-                vv = data["message_details"].get(k)
-                if isinstance(vv, str) and vv.strip():
-                    text = vv.strip()
-                    break
+
+    if not text and "message" in data and isinstance(data["message"], dict):
+        for k in ("raw_message", "message", "msg"):
+            vv = data["message"].get(k)
+            if isinstance(vv, str) and vv.strip():
+                text = vv.strip()
+                break
 
     # find user id
     user = None
@@ -312,14 +304,13 @@ def parse_incoming_request(data):
         user = data["user"].get("id") or data["user"].get("user_id")
     if not user:
         user = data.get("user") or data.get("user_id") or data.get("userid") or data.get("sender")
-    # if user is a map-like string, try parse
     if isinstance(user, dict):
         user = user.get("id")
 
     return user, text
 
 # ---------------------------
-# Core logic: streaks & XP
+# Core logic: streaks & XP (same as before)
 # ---------------------------
 def update_streak_for_user(user_id):
     s = load_user_stats(user_id)
@@ -358,7 +349,7 @@ def count_pomodoros_today(user_id):
     return col_history.count_documents({"user": user_id, "date": today, "type": "pomodoro"})
 
 # ---------------------------
-# Timer watcher (robust)
+# Timer watcher (robust with pre-refresh)
 # ---------------------------
 def timer_watcher():
     print("⏳ Timer watcher thread started.")
@@ -417,7 +408,10 @@ def timer_watcher():
                     current_streak, longest = update_streak_for_user(uid)
                     gained, total_xp, level = update_score(uid, duration, current_streak)
 
-                    # notify
+                    # Force-refresh the token before first important message — long-term fix
+                    refresh_access_token(force=True)
+
+                    # notify - guaranteed fresh token
                     send_message(
                         f"⏰ Pomodoro completed!\n"
                         f"✔ Task: **{task}** ({duration} min)\n\n"
@@ -433,6 +427,7 @@ def timer_watcher():
                     auto_break_min = 15 if (completed_today % 4 == 0) else 5
                     new_break_end = datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(minutes=auto_break_min)
 
+                    # put break in memory and persist
                     with timers_lock:
                         timers[uid] = {
                             "type": "break",
@@ -441,8 +436,6 @@ def timer_watcher():
                             "duration": auto_break_min,
                             "paused_pomodoro": None
                         }
-
-                    # persist break to DB
                     try:
                         set_active_timer(uid, {
                             "type": "break",
@@ -454,6 +447,7 @@ def timer_watcher():
                     except Exception as e:
                         print("DB write error (set_active_timer):", e)
 
+                    # send break started (also safe due to pre-refresh on next loop)
                     send_message(f"☕ Auto-break started for {auto_break_min} minutes. (Type `stop break` to cancel.)")
 
                 # ---------- Break Completed ----------
@@ -497,8 +491,11 @@ def timer_watcher():
                         except Exception as e:
                             print("DB write error (resume set_active_timer):", e)
 
+                        # refresh then notify
+                        refresh_access_token(force=True)
                         send_message(f"⏰ Break over — resuming **{paused.get('task')}** with {remaining//60}m {remaining%60}s left.")
                     else:
+                        refresh_access_token(force=True)
                         send_message("☕ Break over! Ready to get back to work.")
                         # suggest next queued task if available
                         queue = load_tasks_for_user(uid)
@@ -535,21 +532,18 @@ def timer_watcher():
 
         time.sleep(1)
 
-
 # ---------------------------
-# Command parsing & routes
+# Command parsing & routes (kept same as original, small improvements)
 # ---------------------------
 def parse_start_command(text):
     parts = text.strip().split()
     duration = 25
     task = "Untitled Task"
     if len(parts) >= 2 and parts[0].lower() == "start":
-        # start <minutes> <task...>  OR start <task...>
         if len(parts) >= 3 and parts[1].isdigit():
             duration = int(parts[1])
             task = " ".join(parts[2:])
         else:
-            # maybe "start 25 Task name" or "start Task name"
             if parts[1].isdigit():
                 duration = int(parts[1])
                 task = " ".join(parts[2:]) or "Untitled Task"
@@ -571,7 +565,6 @@ def pomodoro_route():
 
     # --- ADD TASK ---
     if raw_lower.startswith("add task"):
-        # expected: add task <task name> <duration>
         parts = raw.strip().split()
         if len(parts) < 4:
             return jsonify({"reply": "Usage: add task <task name> <duration> (minutes)."})
@@ -637,19 +630,17 @@ def pomodoro_route():
             minutes = int(parts[1])
         else:
             return jsonify({"reply": "Usage: break OR break <minutes>"})
-        # start_manual_break: pause pomodoro if running
         with timers_lock:
             cur = timers.get(user)
             paused_pomodoro = None
             if cur and cur.get("type") == "pomodoro":
                 remaining = int(max((cur["end"] - datetime.utcnow().replace(tzinfo=timezone.utc)).total_seconds(), 0))
                 paused_pomodoro = {"task": cur.get("task"), "remaining_seconds": remaining}
-                # remove pomodoro from memory
                 timers.pop(user, None)
-            # start break
             end = datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(minutes=minutes)
             timers[user] = {"type": "break", "end": end, "task": f"Manual Break ({minutes} min)", "duration": minutes, "paused_pomodoro": paused_pomodoro}
             set_active_timer(user, {"type": "break", "end": dt_to_iso(end), "task": f"Manual Break ({minutes} min)", "duration": minutes, "paused_pomodoro": paused_pomodoro})
+        refresh_access_token(force=True)
         send_message(f"☕ Break started for {minutes} minutes. (Type `stop break` to cancel and resume.)")
         return jsonify({"reply": f"☕ Break started for {minutes} minutes."})
 
@@ -677,12 +668,12 @@ def pomodoro_route():
         end = datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(minutes=duration)
         with timers_lock:
             cur = timers.get(user)
-            # if break was running, cancel it
             if cur and cur.get("type") == "break":
                 timers.pop(user, None)
                 remove_active_timer(user)
             timers[user] = {"type": "pomodoro", "end": end, "task": task_name, "duration": duration, "paused_pomodoro": None}
-        set_active_timer(user, {"type": "pomodoro", "end": dt_to_iso(end), "task": task_name, "duration": duration, "paused_pomodoro": None})
+        set_active_timer(user, {"type": "pomodoro", "end": dt_to_iso(end), "task": task_name, "duration": duration})
+        refresh_access_token(force=True)
         return jsonify({"reply": f"🍅 Started **{task_name}** ({duration} min)"})
 
     # --- STATUS ---
@@ -716,6 +707,7 @@ def pomodoro_route():
                 new_end = datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(seconds=remaining)
                 timers[user] = {"type":"pomodoro","end":new_end,"task":paused.get("task"),"duration":round(remaining/60,2),"paused_pomodoro":None}
                 set_active_timer(user, {"type":"pomodoro","end":dt_to_iso(new_end),"task":paused.get("task"),"duration":round(remaining/60,2)})
+                refresh_access_token(force=True)
                 return jsonify({"reply": f"⏯ Resumed **{paused.get('task')}** with {remaining//60}m {remaining%60}s left."})
         return jsonify({"reply": "❌ Nothing to resume."})
 
@@ -728,7 +720,6 @@ def pomodoro_route():
         entries = list(col_history.find({"user": user}).sort("completed_at", -1).limit(21))
         if not entries:
             return jsonify({"reply": "📭 No history"})
-        # simple week summary counts
         summary = {}
         for h in entries:
             summary[h.get("date")] = summary.get(h.get("date"), 0) + 1
@@ -754,7 +745,6 @@ def pomodoro_route():
 
     # --- EXPORT commands routed to /export for PDF generation ---
     if raw_lower.startswith("export"):
-        # forward to /export handler for consistent generation
         return export_report_internal(user, raw_lower)
 
     # --- SUGGESTIONS ---
@@ -850,7 +840,6 @@ def smart_suggestions(user_id):
         suggestions.append("Start with a 15–20 min session to earn XP quickly.")
     elif level >= 8:
         suggestions.append("Try a long deep-work 50–90 min block if possible.")
-    # idle detection
     if history:
         try:
             last = datetime.fromisoformat(history[0].get("completed_at"))
@@ -861,7 +850,6 @@ def smart_suggestions(user_id):
             pass
     if tasks:
         suggestions.append(f"Next task: **{tasks[0]['task']}** ({tasks[0]['duration']} min)")
-    # top frequent task
     freq = {}
     for h in history:
         if h.get("type") == "pomodoro":
@@ -970,7 +958,6 @@ def download_report(filename):
     return send_file(filepath, as_attachment=True)
 
 def export_report_internal(user, raw_lower):
-    # call appropriate generator and reply with link
     if not REPORTLAB_AVAILABLE:
         return jsonify({"reply":"❌ PDF export not available (reportlab missing)."}), 500
     if raw_lower in ("export today", "export daily"):
@@ -993,30 +980,45 @@ def export_route():
     return export_report_internal(user, raw.lower().strip())
 
 # ---------------------------
-# Boot-time watcher start (runs even before first request)
+# Boot-time watcher start (runs even before first request) - robust for Render
 # ---------------------------
 try:
     rehydrate_timers()
 except Exception as e:
     print("rehydrate failed at boot:", e)
 
+# Start watcher now (guarded so we don't start multiple)
 try:
-    threading.Thread(target=timer_watcher, daemon=True).start()
-    app.threads_started = True
-    print("🚀 Timer watcher started on boot")
+    if not getattr(app, "threads_started", False):
+        threading.Thread(target=timer_watcher, daemon=True).start()
+        app.threads_started = True
+        print("🚀 Timer watcher started on boot")
 except Exception as e:
     print("Boot watcher start failed:", e)
-
-
 
 # ---------------------------
 # main
 # ---------------------------
 if __name__ == "__main__":
-    # (Optional for local development only)
+    # Ensure timers rehydrated on dev run
     try:
         rehydrate_timers()
     except Exception as e:
         print("rehydrate_timers failed:", e)
+
+    # Start watcher again (idempotent guard)
+    try:
+        if not getattr(app, "threads_started", False):
+            threading.Thread(target=timer_watcher, daemon=True).start()
+            app.threads_started = True
+            print("🚀 Timer watcher started in __main__")
+    except Exception as e:
+        print("Failed to start watcher in __main__:", e)
+
+    # initial token refresh attempt (best-effort)
+    try:
+        refresh_access_token(force=True)
+    except Exception:
+        pass
 
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
