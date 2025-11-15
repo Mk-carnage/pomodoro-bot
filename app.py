@@ -427,6 +427,16 @@ def timer_watcher():
         time.sleep(1)
 
 
+# -----------------------------------------------
+# Pinging for reducing the sleep of the server
+# -----------------------------------------------
+
+@app.route("/", methods=["GET", "HEAD"])
+def home():
+    return "OK", 200
+
+
+
 # -----------------------------
 # Start background threads on first request
 # -----------------------------
