@@ -63,6 +63,70 @@ app = Flask(__name__)
 timers = {}  # user_id -> timer dict (end as datetime aware UTC)
 timers_lock = threading.Lock()
 
+
+
+# ---------------------------
+# OAuth: Callback + Token Exchange
+# ---------------------------
+
+@app.route("/oauth/callback")
+def oauth_callback():
+    """
+    Zoho redirects here after user accepts.
+    This endpoint only displays the `code` so you can exchange it.
+    """
+    code = request.args.get("code")
+    if not code:
+        return "❌ No authorization code received.", 400
+
+    return f"""
+        <h2>✅ Authorization Code Received</h2>
+        <p>Copy this code and use it in /oauth/exchange:</p>
+        <pre style='padding:10px;border:1px solid #ccc;background:#f7f7f7;'>{code}</pre>
+    """, 200
+
+
+@app.route("/oauth/exchange", methods=["POST"])
+def oauth_exchange():
+    """
+    Convert authorization code → access_token + refresh_token
+    """
+    code = request.json.get("code")
+    if not code:
+        return jsonify({"error": "Missing 'code' field"}), 400
+
+    # Use your existing CLIENT_ID, CLIENT_SECRET, and redirect URI
+    TOKEN_URL = "https://accounts.zoho.com/oauth/v2/token"
+
+    payload = {
+        "grant_type": "authorization_code",
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "redirect_uri": "https://pomodoro-bot-dbmb.onrender.com/oauth/callback",
+        "code": code
+    }
+
+    try:
+        r = requests.post(TOKEN_URL, data=payload)
+        response_data = r.json()
+
+        # If refresh_token exists, show friendly message
+        if "refresh_token" in response_data:
+            return jsonify({
+                "status": "success",
+                "message": "🎉 Refresh token generated successfully!",
+                "refresh_token": response_data["refresh_token"],
+                "access_token": response_data.get("access_token")
+            })
+
+        return jsonify(response_data)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+
+
 # ---------------------------
 # Helpers: datetime <-> iso (UTC)
 # ---------------------------
