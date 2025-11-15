@@ -466,23 +466,6 @@ def timer_watcher():
 
         time.sleep(1)
 
-# ---------------------------
-# Single thread start helper (safe with uptime pings)
-# ---------------------------
-@app.before_request
-def start_threads_once():
-    if not getattr(app, "threads_started", False):
-        try:
-            # rehydrate timers from DB first
-            try:
-                rehydrate_timers()
-            except Exception as e:
-                print("rehydrate_timers error:", e)
-            threading.Thread(target=timer_watcher, daemon=True).start()
-            app.threads_started = True
-            print("🚀 Background threads started (timer watcher).")
-        except Exception as e:
-            print("Failed to start watcher:", e)
 
 # ---------------------------
 # Command parsing & routes
@@ -941,12 +924,30 @@ def export_route():
     return export_report_internal(user, raw.lower().strip())
 
 # ---------------------------
+# Boot-time watcher start (runs even before first request)
+# ---------------------------
+try:
+    rehydrate_timers()
+except Exception as e:
+    print("rehydrate failed at boot:", e)
+
+try:
+    threading.Thread(target=timer_watcher, daemon=True).start()
+    app.threads_started = True
+    print("🚀 Timer watcher started on boot")
+except Exception as e:
+    print("Boot watcher start failed:", e)
+
+
+
+# ---------------------------
 # main
 # ---------------------------
 if __name__ == "__main__":
-    # rehydrate timers before server starts (for local dev)
+    # (Optional for local development only)
     try:
         rehydrate_timers()
     except Exception as e:
         print("rehydrate_timers failed:", e)
+
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
