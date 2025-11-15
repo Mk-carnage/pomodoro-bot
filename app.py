@@ -174,7 +174,7 @@ def refresh_access_token():
     global ZOHO_OAUTH_TOKEN
     if not (CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN):
         return False
-    url = "https://accounts.zoho.in/oauth/v2/token"
+    url = "url = "https://accounts.zoho.com/oauth/v2/token""
     params = {
         "refresh_token": REFRESH_TOKEN,
         "client_id": CLIENT_ID,
