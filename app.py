@@ -190,9 +190,7 @@ def send_zoho_message(text: str, callback_seconds: int = None, user: str = None,
 
     # Zoho requires wrapper under "message"
     payload = {
-        "message": {
-            "text": text
-        }
+      "text": text 
     }
 
     # --- callback support ---
