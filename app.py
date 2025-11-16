@@ -173,35 +173,50 @@ def refresh_access_token():
 
 def send_zoho_message(text: str, callback_seconds: int = None, user: str = None, host_url: str = None):
     """
-    Send message to Zoho bot. If callback_seconds provided, includes bot_callback.
-    We append user info to callback URI as query params so /timer-callback receives user.
+    Send message to Zoho Bot API using correct payload:
+    {
+       "message": {"text": "..."},
+       "bot_callback": {...}
+    }
     """
     if not ZOHO_BOT_API:
         print("ZOHO_BOT_API not set; skipping send_zoho_message.")
         return None
 
-    headers = {"Authorization": ZOHO_OAUTH_TOKEN, "Content-Type": "application/json"}
-    payload = {"text": text}
+    headers = {
+        "Authorization": ZOHO_OAUTH_TOKEN,
+        "Content-Type": "application/json"
+    }
 
+    # ✔ FIXED: Zoho requires message.text wrapper
+    payload = {
+        "message": {
+            "text": text
+        }
+    }
+
+    # ✔ FIXED: create proper callback
     if callback_seconds and host_url:
-        # include user and type param receiver will parse
-        # callback uri example: https://your-host/timer-callback?user=<user>&type=pomodoro
-        # use host_url variable (request.host_url)
-        params = {"user": user} if user else {}
-        callback_uri = f"{host_url.rstrip('/')}/timer-callback"
-        if params:
-            callback_uri = callback_uri + "?" + urlencode(params)
-        payload["bot_callback"] = {"time": int(callback_seconds), "uri": callback_uri}
+        params = {"user": user}
+        callback_uri = f"{host_url.rstrip('/')}/timer-callback?{urlencode(params)}"
+
+        payload["bot_callback"] = {
+            "time": int(callback_seconds),
+            "uri": callback_uri
+        }
 
     try:
         r = requests.post(ZOHO_BOT_API, json=payload, headers=headers, timeout=10)
-        # if unauthorized try refresh once
+
+        # Token expired → refresh once
         if r.status_code == 401:
             if refresh_access_token():
                 headers["Authorization"] = ZOHO_OAUTH_TOKEN
                 r = requests.post(ZOHO_BOT_API, json=payload, headers=headers, timeout=10)
-        print("Zoho send status:", getattr(r, "status_code", None))
+
+        print("Zoho send status:", r.status_code, r.text)
         return r
+
     except Exception as e:
         print("send_zoho_message error:", e)
         return None
@@ -497,34 +512,53 @@ def pomodoro_route():
 @app.route("/timer-callback", methods=["POST"])
 def timer_callback():
     """
-    Zoho will POST to this URL when the bot_callback expires.
-    We expect query params like: /timer-callback?user=<user>
-    or body may include some fields; we'll prefer query param 'user'.
+    Zoho POSTs here when a bot_callback expires.
+    Callback URL includes:  /timer-callback?user=<userid>
     """
-    user = request.args.get("user") or (request.json or {}).get("user") or "unknown"
-    user = str(user)
-    # type param may be a query param (if you included it) or present in body
-    cb_type = request.args.get("type") or (request.json or {}).get("type") or "pomodoro"
-    print("Callback received for user:", user, "type:", cb_type)
 
-    # load active timer (guard)
+    # --------- Extract user safely ---------
+    body = request.json or {}
+
+    user = (
+        request.args.get("user")
+        or body.get("user")
+        or body.get("sender")
+        or body.get("user_id")
+        or "unknown"
+    )
+    user = str(user)
+
+    # Type of callback (pomodoro/break)
+    cb_type = (
+        request.args.get("type")
+        or body.get("type")
+        or "pomodoro"
+    )
+
+    print("🔥 CALLBACK RECEIVED → user:", user, "| type:", cb_type)
+
+    # --------- Load active timer ---------
     t = get_active_timer(user)
     if not t:
-        # nothing to do
+        print("⚠ No active timer in DB for this user.")
         return "no active timer", 200
 
-    # If timer was processed already (pending flag optional) — avoid duplicate processing
-    # We used ends_at to validate; if ends_at in future, ignore.
     ends_at = int(t.get("ends_at", 0))
-    if now_ts() < ends_at - 2:
-        # too early (possible Zoho fired early) — ignore gracefully
-        print("Callback arrived early; ignoring.")
+    now = now_ts()
+
+    # --------- Guard against early calls ---------
+    if now < ends_at - 2:
+        print("⏳ Callback arrived EARLY → ignoring.")
         return "too early", 200
 
     typ = t.get("type", "pomodoro")
+
+    # ======================================================
+    # 🎯 POMODORO FINISHED
+    # ======================================================
     if typ == "pomodoro":
-        # record history
-        completed_at_iso = ts_to_iso(now_ts())
+
+        completed_at_iso = ts_to_iso(now)
         hist_item = {
             "user": user,
             "task": t.get("task", "Untitled Task"),
@@ -535,31 +569,57 @@ def timer_callback():
         }
         append_history(hist_item)
 
-        # update streak & score
+        # Update streak and XP
         current_streak, longest = update_streak_for_user(user)
         gained, total_xp, level = update_score(user, int(t.get("duration", 25)), current_streak)
 
-        # notify completion (simple text message)
+        # Notify completion (Zoho-compliant message)
         send_zoho_message(
-            f"⏰ Pomodoro completed!\n✔ Task: **{hist_item['task']}** ({hist_item['duration']} min)\n\n🔥 Streak: {current_streak} days\n🏆 Longest streak: {longest} days\n\n🎯 XP earned: +{gained}\n💠 Total XP: {total_xp}\n⭐ Level: {level}",
+            (
+                f"⏰ *Pomodoro completed!*\n"
+                f"✔ Task: **{hist_item['task']}** ({hist_item['duration']} min)\n\n"
+                f"🔥 Streak: {current_streak} days\n"
+                f"🏆 Longest streak: {longest} days\n\n"
+                f"🎯 XP earned: +{gained}\n"
+                f"💠 Total XP: {total_xp}\n"
+                f"⭐ Level: {level}"
+            ),
             user=user,
             host_url=request.host_url
         )
 
-        # auto-start break
+        # ======================================================
+        # auto-break scheduling
+        # ======================================================
         completed_today = count_pomodoros_today(user)
         auto_break_min = 15 if (completed_today % 4 == 0) else 5
-        break_ends_at = now_ts() + auto_break_min * 60
-        set_active_timer(user, {"type": "break", "ends_at": break_ends_at, "task": f"Auto Break ({auto_break_min} min)", "duration": auto_break_min})
-        # schedule break via Zoho callback (so break will be processed when done)
-        send_zoho_message(f"☕ Auto-break started for {auto_break_min} minutes. (Type `stop break` to cancel.)",
-                          callback_seconds=auto_break_min * 60, user=user, host_url=request.host_url)
+
+        break_ends_at = now + auto_break_min * 60
+        set_active_timer(
+            user,
+            {
+                "type": "break",
+                "ends_at": break_ends_at,
+                "task": f"Auto Break ({auto_break_min} min)",
+                "duration": auto_break_min
+            }
+        )
+
+        send_zoho_message(
+            f"☕ Auto-break started for {auto_break_min} minutes.\n(Type `stop break` to cancel.)",
+            callback_seconds=auto_break_min * 60,
+            user=user,
+            host_url=request.host_url
+        )
 
         return "ok", 200
 
+    # ======================================================
+    # 🎯 BREAK FINISHED
+    # ======================================================
     elif typ == "break":
-        # record break in history
-        completed_at_iso = ts_to_iso(now_ts())
+
+        completed_at_iso = ts_to_iso(now)
         hist_item = {
             "user": user,
             "task": t.get("task", "Break"),
@@ -570,27 +630,56 @@ def timer_callback():
         }
         append_history(hist_item)
 
-        # if break had a paused pomodoro saved, resume
         paused = t.get("paused_pomodoro")
+
+        # --------- Resume paused pomodoro ---------
         if paused:
             remaining = int(paused.get("remaining_seconds", 0))
-            ends_at = now_ts() + remaining
-            set_active_timer(user, {"type": "pomodoro", "ends_at": ends_at, "task": paused.get("task"), "duration": round(remaining/60, 2)})
-            send_zoho_message(f"⏰ Break over — resuming **{paused.get('task')}** with {remaining//60}m {remaining%60}s left.",
-                              callback_seconds=remaining, user=user, host_url=request.host_url)
-            return "resumed", 200
-        else:
-            # no paused pomodoro; remove timer
-            remove_active_timer(user)
-            send_zoho_message("☕ Break over! Ready to get back to work.", user=user, host_url=request.host_url)
-            # suggest queued task
-            q = load_tasks_for_user(user)
-            if q:
-                next_task = q[0]
-                send_zoho_message(f"⏭ Next task in queue: **{next_task['task']}** ({next_task['duration']} min). Type `start next` to continue.", user=user, host_url=request.host_url)
-            return "ok", 200
+            ends_at = now + remaining
 
+            set_active_timer(
+                user,
+                {
+                    "type": "pomodoro",
+                    "ends_at": ends_at,
+                    "task": paused.get("task"),
+                    "duration": round(remaining/60, 2)
+                }
+            )
+
+            send_zoho_message(
+                f"⏰ Break over — resuming **{paused.get('task')}** with {remaining//60}m {remaining%60}s left.",
+                callback_seconds=remaining,
+                user=user,
+                host_url=request.host_url
+            )
+
+            return "resumed", 200
+
+        # --------- Normal break end (no paused task) ---------
+        remove_active_timer(user)
+
+        send_zoho_message(
+            "☕ Break over! Ready to get back to work.",
+            user=user,
+            host_url=request.host_url
+        )
+
+        # Suggest queued task
+        q = load_tasks_for_user(user)
+        if q:
+            next_task = q[0]
+            send_zoho_message(
+                f"⏭ Next task in queue: **{next_task['task']}** ({next_task['duration']} min).\nType `start next` to continue.",
+                user=user,
+                host_url=request.host_url
+            )
+
+        return "ok", 200
+
+    # ======================================================
     return "ignored", 200
+
 
 # ---------------------------
 # Export / PDF helpers
