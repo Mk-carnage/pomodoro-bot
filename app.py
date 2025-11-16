@@ -172,13 +172,6 @@ def refresh_access_token():
     return False
 
 def send_zoho_message(text: str, callback_seconds: int = None, user: str = None, host_url: str = None):
-    """
-    Send message to Zoho bot using CORRECT payload structure:
-    {
-        "message": { "text": "..." },
-        "bot_callback": ...
-    }
-    """
     if not ZOHO_BOT_API:
         print("ZOHO_BOT_API not set; skipping send_zoho_message.")
         return None
@@ -188,17 +181,20 @@ def send_zoho_message(text: str, callback_seconds: int = None, user: str = None,
         "Content-Type": "application/json"
     }
 
-    # Zoho requires wrapper under "message"
+    # Zoho requires this structure:
     payload = {
-      "text": text 
+        "message": {
+            "text": text
+        }
     }
 
-    # --- callback support ---
+    # Add callback (if needed)
     if callback_seconds and host_url:
         params = {}
         if user:
             params["user"] = user
 
+        # Build callback URL
         callback_uri = f"{host_url.rstrip('/')}/timer-callback"
         if params:
             callback_uri += "?" + urlencode(params)
@@ -208,10 +204,12 @@ def send_zoho_message(text: str, callback_seconds: int = None, user: str = None,
             "uri": callback_uri
         }
 
+    print("📨 PAYLOAD SENT TO ZOHO:", payload)
+
     try:
         r = requests.post(ZOHO_BOT_API, json=payload, headers=headers, timeout=10)
 
-        # retry once on expired token
+        # retry on expired token
         if r.status_code == 401:
             if refresh_access_token():
                 headers["Authorization"] = ZOHO_OAUTH_TOKEN
@@ -223,6 +221,7 @@ def send_zoho_message(text: str, callback_seconds: int = None, user: str = None,
     except Exception as e:
         print("send_zoho_message error:", e)
         return None
+
 
 # ---------------------------
 # Utility: parse incoming request (robust)
