@@ -173,10 +173,10 @@ def refresh_access_token():
 
 def send_zoho_message(text: str, callback_seconds: int = None, user: str = None, host_url: str = None):
     """
-    Send message to Zoho Bot API using correct payload:
+    Send message to Zoho bot using CORRECT payload structure:
     {
-       "message": {"text": "..."},
-       "bot_callback": {...}
+        "message": { "text": "..." },
+        "bot_callback": ...
     }
     """
     if not ZOHO_BOT_API:
@@ -188,17 +188,22 @@ def send_zoho_message(text: str, callback_seconds: int = None, user: str = None,
         "Content-Type": "application/json"
     }
 
-    # ✔ FIXED: Zoho requires message.text wrapper
+    # Zoho requires wrapper under "message"
     payload = {
         "message": {
             "text": text
         }
     }
 
-    # ✔ FIXED: create proper callback
+    # --- callback support ---
     if callback_seconds and host_url:
-        params = {"user": user}
-        callback_uri = f"{host_url.rstrip('/')}/timer-callback?{urlencode(params)}"
+        params = {}
+        if user:
+            params["user"] = user
+
+        callback_uri = f"{host_url.rstrip('/')}/timer-callback"
+        if params:
+            callback_uri += "?" + urlencode(params)
 
         payload["bot_callback"] = {
             "time": int(callback_seconds),
@@ -208,7 +213,7 @@ def send_zoho_message(text: str, callback_seconds: int = None, user: str = None,
     try:
         r = requests.post(ZOHO_BOT_API, json=payload, headers=headers, timeout=10)
 
-        # Token expired → refresh once
+        # retry once on expired token
         if r.status_code == 401:
             if refresh_access_token():
                 headers["Authorization"] = ZOHO_OAUTH_TOKEN
