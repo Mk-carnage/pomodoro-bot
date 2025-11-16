@@ -181,12 +181,12 @@ def send_zoho_message(text: str, callback_seconds: int = None, user: str = None,
         "Content-Type": "application/json"
     }
 
+    # minimal correct payload
     payload = {
-        "text": text,           # <--- REQUIRED
-        "fallback": False       # optional but recommended
+        "text": text
     }
 
-    # Callback
+    # callback support
     if callback_seconds and host_url:
         params = {}
         if user:
@@ -217,6 +217,7 @@ def send_zoho_message(text: str, callback_seconds: int = None, user: str = None,
     except Exception as e:
         print("send_zoho_message error:", e)
         return None
+
 
 # ---------------------------
 # Utility: parse incoming request (robust)
