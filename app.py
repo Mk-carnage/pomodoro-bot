@@ -182,12 +182,11 @@ def send_zoho_message(text: str, callback_seconds: int = None, user: str = None,
     }
 
     payload = {
-        "message": {
-            "text": text
-        },
-        "fallback": False   # 🔥 REQUIRED FOR CALLBACKS
+        "text": text,           # <--- REQUIRED
+        "fallback": False       # optional but recommended
     }
 
+    # Callback
     if callback_seconds and host_url:
         params = {}
         if user:
@@ -206,6 +205,7 @@ def send_zoho_message(text: str, callback_seconds: int = None, user: str = None,
 
     try:
         r = requests.post(ZOHO_BOT_API, json=payload, headers=headers, timeout=10)
+
         if r.status_code == 401:
             if refresh_access_token():
                 headers["Authorization"] = ZOHO_OAUTH_TOKEN
@@ -213,11 +213,10 @@ def send_zoho_message(text: str, callback_seconds: int = None, user: str = None,
 
         print("Zoho send status:", r.status_code, r.text)
         return r
+
     except Exception as e:
         print("send_zoho_message error:", e)
         return None
-
-
 
 # ---------------------------
 # Utility: parse incoming request (robust)
