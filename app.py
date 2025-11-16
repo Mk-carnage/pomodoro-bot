@@ -569,6 +569,42 @@ def parse_start_command(text):
                 task = " ".join(parts[1:]) or "Untitled Task"
     return duration, task
 
+def start_pomodoro(user_id, duration, task):
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    end = now + timedelta(minutes=duration)
+
+    timers = load_timers()
+
+    timers[user_id] = {
+        "type": "pomodoro",
+        "task": task,
+        "duration": duration,
+        "end": int(end.timestamp()),
+        "paused_pomodoro": None
+    }
+
+    save_timers(timers)
+    return end
+def start_break(user_id, minutes, paused_pomodoro=None):
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    end = now + timedelta(minutes=minutes)
+
+    timers = load_timers()
+
+    timers[user_id] = {
+        "type": "break",
+        "task": f"Break ({minutes} min)",
+        "duration": minutes,
+        "end": int(end.timestamp()),
+        "paused_pomodoro": paused_pomodoro
+    }
+
+    save_timers(timers)
+    return end
+
+
+
+
 @app.route("/pomodoro", methods=["POST"])
 def pomodoro_route():
     data = request.json or {}
