@@ -1,31 +1,24 @@
 # app.py
 """
-Pomodoro bot with server-driven timers + Zoho Card UI (mixed themes).
-Supports commands (from Cliq handlers / Postman / Deluge):
-- start [<minutes>] [<task name>]
-- break [<minutes>]
-- stop / cancel / end
-- stop break
-- resume
-- start next
-- add task <task name> <duration>
-- tasks
-- done <n>
-- clear tasks
-- status/time/progress
-- today / week / chart / streak / score
-- export today|week|month
-- suggest
+Pomodoro bot (server-driven timers)
+- Uses MongoDB for persistence
+- Sends messages to Zoho via POST { "text": "..." } to the bot message endpoint
+- No bot_callback usage — server schedules and sends messages when timers expire
 """
 
-import os, time, json, threading
+import os
+import time
+import json
+import threading
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from urllib.parse import urlencode
+
 from flask import Flask, request, jsonify, send_file
 import requests
 from pymongo import MongoClient
 
-# Optional reportlab
+# Optional PDF export (unchanged)
 try:
     from reportlab.pdfgen import canvas
     from reportlab.lib.pagesizes import A4
@@ -33,12 +26,18 @@ try:
 except Exception:
     REPORTLAB_AVAILABLE = False
 
-# ----------------- CONFIG (ENV) -----------------
+# ---------------------------
+# Config (env)
+# ---------------------------
 MONGO_URI = os.getenv("MONGO_URI", "")
 MONGO_DB = os.getenv("MONGO_DB", "pomodoro_db")
 
-ZOHO_BOT_API = os.getenv("ZOHO_BOT_API", "")  # e.g. https://cliq.zoho.com/api/v2/bots/<botunique>/message
-ZOHO_OAUTH_TOKEN = os.getenv("ZOHO_OAUTH_TOKEN", "")  # 'Zoho-oauthtoken <token>'
+# Zoho bot API (message endpoint)
+# e.g. https://cliq.zoho.com/api/v2/bots/<botunique>/message
+ZOHO_BOT_API = os.getenv("ZOHO_BOT_API", "")
+# OAuth token string in the form 'Zoho-oauthtoken <token>'
+ZOHO_OAUTH_TOKEN = os.getenv("ZOHO_OAUTH_TOKEN", "")
+# refresh token flow params (optional, for server to refresh)
 CLIENT_ID = os.getenv("CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")
 REFRESH_TOKEN = os.getenv("REFRESH_TOKEN", "")
@@ -54,36 +53,50 @@ REPORT_DIR = "reports"
 os.makedirs(REPORT_DIR, exist_ok=True)
 
 if not MONGO_URI:
-    raise RuntimeError("MONGO_URI must be set in env")
+    raise RuntimeError("MONGO_URI environment variable must be set.")
 
-# ----------------- DB -----------------
+if not ZOHO_BOT_API:
+    print("WARNING: ZOHO_BOT_API not set. Messages to Zoho will fail until configured.")
+
+# ---------------------------
+# Mongo
+# ---------------------------
 client = MongoClient(MONGO_URI)
 db = client[MONGO_DB]
-col_timers = db.get_collection("timers")      # {user, type, ends_at, task, duration, paused_pomodoro}
+col_timers = db.get_collection("timers")      # { user, type, ends_at, task, duration, paused_pomodoro }
 col_history = db.get_collection("history")
 col_tasks = db.get_collection("tasks")
 col_users = db.get_collection("users")
 
-# ensure index
 try:
     col_timers.create_index("user", unique=True)
 except Exception:
     pass
 
-# ----------------- Flask -----------------
+# ---------------------------
+# Flask
+# ---------------------------
 app = Flask(__name__)
 
-# ----------------- Helpers -----------------
-def now_ts(): return int(time.time())
-def ts_to_iso(ts:int): return datetime.fromtimestamp(ts, timezone.utc).isoformat()
-def iso_to_dt(s: str):
+# ---------------------------
+# Utilities
+# ---------------------------
+def now_ts() -> int:
+    return int(time.time())
+
+def ts_to_iso(ts: int) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat()
+
+def iso_to_dt(iso: str) -> datetime:
     try:
-        if s is None: return datetime.utcnow().replace(tzinfo=timezone.utc)
-        s2 = str(s).replace("Z","+00:00")
-        return datetime.fromisoformat(s2).astimezone(timezone.utc)
-    except:
+        s = str(iso).replace("Z", "+00:00")
+        return datetime.fromisoformat(s).astimezone(timezone.utc)
+    except Exception:
         return datetime.utcnow().replace(tzinfo=timezone.utc)
 
+# ---------------------------
+# DB helpers
+# ---------------------------
 def set_active_timer(user: str, timer_obj: dict):
     doc = timer_obj.copy()
     doc["user"] = user
@@ -99,8 +112,8 @@ def append_history(item: dict):
     col_history.insert_one(item)
 
 def load_tasks_for_user(user: str):
-    d = col_tasks.find_one({"user": user})
-    return d.get("queue", []) if d else []
+    doc = col_tasks.find_one({"user": user})
+    return doc.get("queue", []) if doc else []
 
 def save_tasks_for_user(user: str, queue):
     col_tasks.find_one_and_update({"user": user}, {"$set": {"queue": queue}}, upsert=True)
@@ -108,26 +121,30 @@ def save_tasks_for_user(user: str, queue):
 def load_user_stats(user: str):
     doc = col_users.find_one({"user": user})
     if not doc:
-        return {"xp":0,"level":1,"current_streak":0,"longest_streak":0,"last_completed_date":None}
+        return {"xp": 0, "level": 1, "current_streak": 0, "longest_streak": 0, "last_completed_date": None}
     return {
-        "xp": doc.get("xp",0),
-        "level": doc.get("level",1),
-        "current_streak": doc.get("current_streak",0),
-        "longest_streak": doc.get("longest_streak",0),
+        "xp": doc.get("xp", 0),
+        "level": doc.get("level", 1),
+        "current_streak": doc.get("current_streak", 0),
+        "longest_streak": doc.get("longest_streak", 0),
         "last_completed_date": doc.get("last_completed_date")
     }
 
 def save_user_stats(user: str, stats: dict):
-    s = stats.copy()
-    s["user"] = user
-    col_users.find_one_and_update({"user": user}, {"$set": s}, upsert=True)
+    stats = stats.copy()
+    stats["user"] = user
+    col_users.find_one_and_update({"user": user}, {"$set": stats}, upsert=True)
 
-# ----------------- OAuth / Zoho -----------------
-ZOHO_LOCK = threading.Lock()
+# ---------------------------
+# OAuth / Zoho messaging
+# ---------------------------
+ZOHO_LOCK = threading.Lock()  # protect ZOHO_OAUTH_TOKEN update
 
 def refresh_access_token():
+    """Use refresh_token to update ZOHO_OAUTH_TOKEN (in-memory only)."""
     global ZOHO_OAUTH_TOKEN
     if not (CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN):
+        print("No CLIENT_ID/CLIENT_SECRET/REFRESH_TOKEN configured.")
         return False
     url = f"{ZOHO_ACCOUNTS_BASE}/oauth/v2/token"
     params = {
@@ -142,76 +159,77 @@ def refresh_access_token():
         if "access_token" in j:
             with ZOHO_LOCK:
                 ZOHO_OAUTH_TOKEN = "Zoho-oauthtoken " + j["access_token"]
-            print("🔄 Zoho token refreshed.")
+            print("🔄 Refreshed Zoho Access Token.")
             return True
         else:
-            print("Refresh failed:", j)
+            print("refresh token error:", j)
     except Exception as e:
-        print("Refresh exception:", e)
+        print("refresh_access_token exception:", e)
     return False
 
-def send_zoho_message(text: str, card: dict = None, buttons: list = None):
+def send_zoho_message(text: str, user_hint: str = None):
     """
-    Compose payload per Zoho v2 API:
-    - Must include text (string)
-    - Optional card (object) and buttons (array)
+    Sends a simple message to Zoho bot message API.
+    Payload: { "text": "..." }  (Zoho requires 'text' key)
     """
     if not ZOHO_BOT_API:
-        print("ZOHO_BOT_API not configured - skipping send.")
+        print("ZOHO_BOT_API not set; skipping send_zoho_message.")
         return None
+
     headers = {
         "Authorization": ZOHO_OAUTH_TOKEN,
         "Content-Type": "application/json"
     }
     payload = {"text": text}
-    if card:
-        payload["card"] = card
-    if buttons:
-        payload["buttons"] = buttons
 
-    # debug
-    print("📨 Sending to Zoho:", json.dumps(payload)[:800])
+    # helpful debug
+    print("📨 PAYLOAD SENT TO ZOHO:", payload)
+
     try:
         r = requests.post(ZOHO_BOT_API, json=payload, headers=headers, timeout=10)
         if r.status_code == 401:
+            # try refresh once
+            print("Zoho 401 — attempting refresh.")
             if refresh_access_token():
                 headers["Authorization"] = ZOHO_OAUTH_TOKEN
                 r = requests.post(ZOHO_BOT_API, json=payload, headers=headers, timeout=10)
-        print("Zoho status:", r.status_code, r.text[:400])
+        print("Zoho send status:", getattr(r, "status_code", None), getattr(r, "text", None))
         return r
     except Exception as e:
-        print("send_zoho_message exception:", e)
+        print("send_zoho_message error:", e)
         return None
 
-# ----------------- Scoring / streaks -----------------
+# ---------------------------
+# Scoring / streaks
+# ---------------------------
 def update_streak_for_user(user_id: str):
     s = load_user_stats(user_id)
     today = datetime.utcnow().strftime("%Y-%m-%d")
     yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
     last = s.get("last_completed_date")
     if last == yesterday:
-        s["current_streak"] = s.get("current_streak",0) + 1
+        s["current_streak"] = s.get("current_streak", 0) + 1
     elif last != today:
         s["current_streak"] = 1
-    s["longest_streak"] = max(s.get("longest_streak",0), s.get("current_streak",0))
+    s["longest_streak"] = max(s.get("longest_streak", 0), s.get("current_streak", 0))
     s["last_completed_date"] = today
     save_user_stats(user_id, s)
     return s["current_streak"], s["longest_streak"]
 
-def calculate_level(xp:int):
+def calculate_level(xp: int):
     if xp < 100: return 1
     if xp < 250: return 2
     if xp < 500: return 3
     if xp < 1000: return 4
     return xp // 500 + 4
 
-def update_score(user_id:str, duration:int, streak:int):
+def update_score(user_id: str, duration: int, streak: int):
     s = load_user_stats(user_id)
-    base = int(duration)
+    base_xp = int(duration)
     streak_bonus = streak * 5
     long_bonus = 10 if duration >= 30 else 0
-    gained = base + streak_bonus + long_bonus
-    s["xp"] = s.get("xp",0) + gained
+    gained = base_xp + streak_bonus + long_bonus
+    s["xp"] = s.get("xp", 0) + gained
     s["level"] = calculate_level(s["xp"])
     save_user_stats(user_id, s)
     return gained, s["xp"], s["level"]
@@ -220,95 +238,105 @@ def count_pomodoros_today(user_id: str):
     today = datetime.utcnow().strftime("%Y-%m-%d")
     return col_history.count_documents({"user": user_id, "date": today, "type": "pomodoro"})
 
-# ----------------- Timer Engine -----------------
-timer_threads = {}
+# ---------------------------
+# Timer engine (server-driven)
+# ---------------------------
+timer_threads = {}   # user -> Thread
 timer_threads_lock = threading.Lock()
 
 def _timer_worker(user: str):
-    print("Timer worker start:", user)
+    """
+    Worker that monitors the DB entry for user's active timer and fires actions when ends_at reached.
+    Allows cancellation by removing DB entry.
+    """
+    print(f"Timer worker started for user={user}")
     while True:
         t = get_active_timer(user)
         if not t:
-            print("No active timer - worker exit:", user)
+            print(f"No timer entry for {user}; worker exiting.")
             break
-        ends_at = int(t.get("ends_at",0))
+        ends_at = int(t.get("ends_at", 0))
         remaining = ends_at - now_ts()
         if remaining <= 0:
+            # timer complete — process based on type
             typ = t.get("type", "pomodoro")
             if typ == "pomodoro":
-                # record
-                completed_iso = ts_to_iso(now_ts())
-                hist = {
+                # record history
+                completed_at_iso = ts_to_iso(now_ts())
+                hist_item = {
                     "user": user,
-                    "task": t.get("task","Untitled Task"),
-                    "duration": int(t.get("duration",25)),
-                    "completed_at": completed_iso,
+                    "task": t.get("task", "Untitled Task"),
+                    "duration": int(t.get("duration", 25)),
+                    "completed_at": completed_at_iso,
                     "date": datetime.utcnow().strftime("%Y-%m-%d"),
                     "type": "pomodoro"
                 }
-                append_history(hist)
+                append_history(hist_item)
 
-                # update user stats
+                # update streak & xp
                 current_streak, longest = update_streak_for_user(user)
-                gained, total_xp, level = update_score(user, int(t.get("duration",25)), current_streak)
+                gained, total_xp, level = update_score(user, int(t.get("duration", 25)), current_streak)
 
-                # send completion card once (text + card)
-                card = build_completed_card(user, hist, current_streak, longest, gained, total_xp, level)
-                send_zoho_message(text=f"Pomodoro completed: {hist['task']}", card=card)
+                # notify completion
+                send_zoho_message(
+                    f"⏰ Pomodoro completed!\n✔ Task: **{hist_item['task']}** ({hist_item['duration']} min)\n\n"
+                    f"🔥 Streak: {current_streak} days\n🏆 Longest streak: {longest} days\n\n"
+                    f"🎯 XP earned: +{gained}\n💠 Total XP: {total_xp}\n⭐ Level: {level}"
+                )
 
                 # auto-start break
                 completed_today = count_pomodoros_today(user)
                 auto_break_min = 15 if (completed_today % 4 == 0) else 5
                 break_ends_at = now_ts() + auto_break_min * 60
-                set_active_timer(user, {"type":"break","ends_at":break_ends_at,"task":f"Auto Break ({auto_break_min} min)","duration":auto_break_min})
-                # send break started card
-                bcard = build_break_card(user, auto_break_min, auto=True)
-                send_zoho_message(text=f"Auto-break started for {auto_break_min} minutes.", card=bcard)
+                set_active_timer(user, {"type": "break", "ends_at": break_ends_at, "task": f"Auto Break ({auto_break_min} min)", "duration": auto_break_min})
+                send_zoho_message(f"☕ Auto-break started for {auto_break_min} minutes. (Type `stop break` to cancel.)")
 
-                # continue to monitor break
+                # loop to continue worker for break
                 continue
 
             elif typ == "break":
                 # record break
-                completed_iso = ts_to_iso(now_ts())
-                hist = {
+                completed_at_iso = ts_to_iso(now_ts())
+                hist_item = {
                     "user": user,
-                    "task": t.get("task","Break"),
-                    "duration": int(t.get("duration",5)),
-                    "completed_at": completed_iso,
+                    "task": t.get("task", "Break"),
+                    "duration": int(t.get("duration", 5)),
+                    "completed_at": completed_at_iso,
                     "date": datetime.utcnow().strftime("%Y-%m-%d"),
                     "type": "break"
                 }
-                append_history(hist)
+                append_history(hist_item)
 
                 paused = t.get("paused_pomodoro")
                 if paused:
-                    remaining_sec = int(paused.get("remaining_seconds",0))
-                    ends_at = now_ts() + remaining_sec
-                    set_active_timer(user, {"type":"pomodoro","ends_at":ends_at,"task":paused.get("task"),"duration":round(remaining_sec/60,2)})
-                    # notify resumed
-                    send_zoho_message(text=f"Break over — resuming {paused.get('task')}",
-                                     card=build_resume_card(user, paused))
+                    remaining = int(paused.get("remaining_seconds", 0))
+                    ends_at = now_ts() + remaining
+                    set_active_timer(user, {"type": "pomodoro", "ends_at": ends_at, "task": paused.get("task"), "duration": round(remaining/60, 2)})
+                    send_zoho_message(f"⏰ Break over — resuming **{paused.get('task')}** with {remaining//60}m {remaining%60}s left.")
                     continue
                 else:
                     remove_active_timer(user)
-                    send_zoho_message(text="Break over! Ready to get back to work.",
-                                     card=build_simple_card("Break over", "Ready to get back to work.", theme="standard"))
+                    send_zoho_message("☕ Break over! Ready to get back to work.")
                     q = load_tasks_for_user(user)
                     if q:
-                        send_zoho_message(text=f"Next task in queue: {q[0]['task']}",
-                                         card=build_task_queue_card(user))
+                        next_task = q[0]
+                        send_zoho_message(f"⏭ Next task in queue: **{next_task['task']}** ({next_task['duration']} min). Type `start next` to continue.")
                     break
+
             else:
+                # unknown type - clean up
                 remove_active_timer(user)
                 break
+
         else:
-            sleep_for = min(1.0, max(0.25, remaining))
+            # sleep for a short time but also allow quick reaction to cancel/update
+            sleep_for = min(1.0, max(0.1, remaining))
             time.sleep(sleep_for)
 
+    # remove thread from registry
     with timer_threads_lock:
         timer_threads.pop(user, None)
-    print("Timer worker ended:", user)
+    print(f"Timer worker ended for user={user}")
 
 def start_timer_thread_if_needed(user: str):
     with timer_threads_lock:
@@ -318,7 +346,11 @@ def start_timer_thread_if_needed(user: str):
         timer_threads[user] = t
         t.start()
 
-def schedule_timer(user:str, typ:str, duration_min: float, task:str, paused_pomodoro=None):
+def schedule_timer(user: str, typ: str, duration_min: int, task: str, paused_pomodoro=None):
+    """
+    Store timer in DB and start worker thread for that user.
+    typ: "pomodoro" or "break"
+    """
     ends_at = now_ts() + int(duration_min * 60)
     doc = {"type": typ, "ends_at": ends_at, "task": task, "duration": duration_min}
     if paused_pomodoro:
@@ -326,271 +358,41 @@ def schedule_timer(user:str, typ:str, duration_min: float, task:str, paused_pomo
     set_active_timer(user, doc)
     start_timer_thread_if_needed(user)
 
+# Rehydrate timers on boot
 def rehydrate_timers():
     docs = list(col_timers.find({}))
     for d in docs:
-        u = d.get("user")
-        if not u: continue
-        start_timer_thread_if_needed(u)
-    print("Rehydrated timers:", len(docs))
+        user = d.get("user")
+        if not user:
+            continue
+        # If timer already passed, let worker handle immediate execution by starting thread
+        start_timer_thread_if_needed(user)
+    print(f"Rehydrated {len(docs)} timers from DB.")
 
-# ----------------- Request parsing -----------------
+# ---------------------------
+# Request parsing helper
+# ---------------------------
 def parse_incoming_request(data):
-    # Accept either {"raw": "...", "user": "123"} or Zoho message object etc.
     if not isinstance(data, dict):
-        return "unknown", ""
-    for key in ("raw","message","msg","text","raw_message","raw_msg"):
+        return None, ""
+    for key in ("raw", "message", "msg", "text", "raw_message", "raw_msg"):
         v = data.get(key)
         if isinstance(v, str) and v.strip():
-            return str(data.get("user") or data.get("user_id") or data.get("sender") or "unknown"), v.strip()
-    # message_details (Zoho)
+            return data.get("user") or data.get("user_id") or data.get("sender") or data.get("userid") or "unknown", v.strip()
     if "message_details" in data and isinstance(data["message_details"], dict):
         md = data["message_details"]
-        for key in ("raw_message","message","text"):
+        for key in ("raw_message", "message"):
             v = md.get(key)
             if isinstance(v, str) and v.strip():
-                return str(data.get("user") or md.get("from") or "unknown"), v.strip()
-    # fallback: whole raw
-    if data.get("raw"):
-        return str(data.get("user") or data.get("user_id") or "unknown"), str(data.get("raw"))
-    return str(data.get("user") or data.get("user_id") or "unknown"), ""
+                return data.get("user") or md.get("from") or "unknown", v.strip()
+    return data.get("user") or data.get("user_id") or "unknown", ""
 
-# ----------------- Cards builders (mix themes) -----------------
-def build_simple_card(title, subtitle, theme="standard", thumbnail=None):
-    card = {"title": title, "theme": theme, "sections": [{"widgets":[{"type":"label","text": subtitle}]}]}
-    if thumbnail:
-        card["thumbnail"] = thumbnail
-    return card
-
-def build_start_card(user:str, task:str, duration:int):
-    card = {
-        "title": "Pomodoro Started",
-        "theme": "primary",
-        "thumbnail": "https://img.icons8.com/color/96/tomato.png",
-        "sections": [
-            {"widgets":[
-                {"type":"label","text": f"Task: {task}"},
-                {"type":"label","text": f"Duration: {duration} min"},
-            ]}
-        ]
-    }
-    buttons = [
-        {"label":"Status","type":"+","action":{"type":"invoke.function","data":{"name":"status_cmd"}}},
-        {"label":"Stop","type":"-","action":{"type":"invoke.function","data":{"name":"stop_cmd"}}}
-    ]
-    return {"text": f"Started {task} ({duration} min)", "card": card, "buttons": buttons}
-
-def build_status_card_payload(user:str):
-    cur = get_active_timer(user)
-    if not cur:
-        card = {"title":"Status","theme":"standard","sections":[{"widgets":[{"type":"label","text":"No active session."}]}]}
-        return {"text":"No active session.","card":card,"buttons":[{"label":"Start","type":"+","action":{"type":"invoke.function","data":{"name":"start_cmd"}}}]}
-    rem = max(0, cur.get("ends_at",0) - now_ts())
-    typ = cur.get("type","pomodoro")
-    mins = rem//60
-    secs = rem%60
-    card = {
-        "title":"Session Status",
-        "theme":"standard",
-        "thumbnail":"https://img.icons8.com/color/96/tomato.png",
-        "sections":[
-            {"widgets":[
-                {"type":"label","text":f"Task: {cur.get('task')}"},
-                {"type":"label","text":f"Type: {typ}"},
-                {"type":"label","text":f"Remaining: {mins}m {secs}s"},
-            ]}
-        ]
-    }
-    buttons = [
-        {"label":"Stop","type":"-","action":{"type":"invoke.function","data":{"name":"stop_cmd"}}},
-        {"label":"Break","type":"+","action":{"type":"invoke.function","data":{"name":"break_cmd"}}}
-    ]
-    return {"text": f"Status for {cur.get('task')}", "card": card, "buttons": buttons}
-
-def build_break_card(user:str, minutes:int, auto=False):
-    title = "Auto Break Started" if auto else "Break Started"
-    theme = "warning"
-    card = {
-        "title": title,
-        "theme": theme,
-        "sections":[{"widgets":[
-            {"type":"label","text":f"Break for {minutes} minutes."}
-        ]}]
-    }
-    buttons = [{"label":"Stop Break","type":"-","action":{"type":"invoke.function","data":{"name":"stopbreak_cmd"}}}]
-    return {"text": f"Break started for {minutes} minutes.", "card": card, "buttons": buttons}
-
-def build_completed_card(user:str, hist:dict, streak:int, longest:int, gained:int, total_xp:int, level:int):
-    card = {
-        "title":"Pomodoro Completed",
-        "theme":"success",
-        "thumbnail":"https://img.icons8.com/color/96/tomato.png",
-        "sections":[
-            {"widgets":[
-                {"type":"label","text": f"Task: {hist.get('task')} ({hist.get('duration')} min)"},
-                {"type":"label","text": f"Streak: {streak} days  •  Longest: {longest}"},
-                {"type":"label","text": f"XP earned: +{gained}  •  Total XP: {total_xp}  •  Level: {level}"}
-            ]}
-        ]
-    }
-    buttons = [{"label":"View Summary","type":"+", "action":{"type":"invoke.function","data":{"name":"today_cmd"}}}]
-    return {"text": f"Pomodoro complete: {hist.get('task')}", "card": card, "buttons": buttons}
-
-def build_resume_card(user:str, paused:dict):
-    card = {"title":"Resume Pomodoro","theme":"primary","sections":[{"widgets":[{"type":"label","text":f"Resuming {paused.get('task')}"}]}]}
-    return {"text": f"Resuming {paused.get('task')}", "card": card}
-
-def build_task_queue_card(user:str):
-    q = load_tasks_for_user(user)
-    if not q:
-        return {"text":"No tasks.","card": build_simple_card("Task Queue","No tasks in queue.", theme="standard")}
-    widgets = []
-    for i, t in enumerate(q, start=1):
-        widgets.append({"type":"label","text":f"{i}. {t['task']} ({t['duration']} min)"})
-    card = {"title":"Task Queue","theme":"primary","sections":[{"widgets": widgets}]}
-    return {"text":"Task queue","card": card}
-
-def build_daily_summary_card(user:str):
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    entries = list(col_history.find({"user": user, "date": today}))
-    if not entries:
-        return {"text":"No activity today.","card": build_simple_card("Daily Summary","No activity today.", theme="standard")}
-    total = 0
-    widgets = []
-    for h in entries:
-        widgets.append({"type":"label","text":f"- {h.get('task')} ({h.get('duration')}m, {h.get('type')})"})
-        if h.get("type")=="pomodoro": total += int(h.get("duration",0))
-    card = {"title":"Daily Summary","theme":"standard","sections":[{"widgets":[{"type":"label","text":f"Total focus: {total} min"}] + widgets}]}
-    return {"text":"Daily summary", "card":card}
-
-def build_weekly_analytics_card(user:str):
-    docs = list(col_history.find({"user": user}))
-    if not docs:
-        return {"text":"No history","card": build_simple_card("Weekly Analytics","No history available.", theme="standard")}
-    days = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-    weekly = {d:{"count":0,"minutes":0} for d in days}
-    for h in docs:
-        try:
-            dt = iso_to_dt(h.get("completed_at"))
-            weekday = days[dt.weekday()]
-        except:
-            weekday = days[0]
-        weekly[weekday]["count"] += 1
-        weekly[weekday]["minutes"] += int(h.get("duration",0))
-    widgets = []
-    for d in days:
-        widgets.append({"type":"label","text":f"{d}: {weekly[d]['count']} sessions ({weekly[d]['minutes']} min)"})
-    card = {"title":"Weekly Analytics","theme":"primary","sections":[{"widgets": widgets}]}
-    return {"text":"Weekly analytics","card":card}
-
-def build_score_card(user:str):
-    s = load_user_stats(user)
-    card = {"title":"Your Score","theme":"standard","sections":[{"widgets":[
-        {"type":"label","text":f"XP: {s.get('xp',0)}"},
-        {"type":"label","text":f"Level: {s.get('level',1)}"},
-        {"type":"label","text":f"Streak: {s.get('current_streak',0)} days"},
-    ]}]}
-    return {"text":"Your score","card":card}
-
-def build_suggestion_card(user:str, suggestions:list):
-    # Use poll theme for interactive feel
-    widgets = [{"type":"label","text": s} for s in suggestions]
-    card = {"title":"Suggestions","theme":"poll","sections":[{"widgets":[{"type":"label","text":"Here are some suggestions:"}] + widgets}]}
-    # include a "Try" button
-    buttons = [{"label":"Try 15min","type":"+","action":{"type":"invoke.function","data":{"name":"start_15_cmd"}}}]
-    return {"text":"Suggestions", "card":card, "buttons":buttons}
-
-# ----------------- Exports -----------------
-def create_pdf(filepath, title, lines):
-    if not REPORTLAB_AVAILABLE:
-        raise RuntimeError("reportlab missing")
-    c = canvas.Canvas(filepath, pagesize=A4)
-    w,h = A4
-    c.setFont("Helvetica-Bold", 18)
-    c.drawString(50, h-80, title)
-    c.setFont("Helvetica", 12)
-    y = h-120
-    for line in lines:
-        if y < 60:
-            c.showPage()
-            y = h-60
-        c.drawString(50,y,line)
-        y -= 18
-    c.save()
-
-def generate_daily_report(user):
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    entries = list(col_history.find({"user": user, "date": today}))
-    fp = f"{REPORT_DIR}/daily_{user}.pdf"
-    lines = []
-    total = 0
-    if not entries:
-        lines.append("No activity today.")
-    else:
-        for h in entries:
-            lines.append(f"{h.get('date')} - {h.get('task')} ({h.get('duration')}m, {h.get('type')})")
-            if h.get("type")=="pomodoro": total += int(h.get("duration",0))
-        lines.append(f"Total focus: {total}m")
-    create_pdf(fp, "Daily Report", lines)
-    return fp
-
-def generate_weekly_report(user):
-    start = datetime.utcnow().replace(tzinfo=timezone.utc) - timedelta(days=7)
-    entries = [h for h in col_history.find({"user":user}) if iso_to_dt(h.get("completed_at")) >= start]
-    fp = f"{REPORT_DIR}/weekly_{user}.pdf"
-    lines = []
-    for h in entries: lines.append(f"{h.get('date')} - {h.get('task')} ({h.get('duration')}m)")
-    create_pdf(fp, "Weekly Report", lines)
-    return fp
-
-def generate_monthly_report(user):
-    start = datetime.utcnow().replace(tzinfo=timezone.utc) - timedelta(days=30)
-    entries = [h for h in col_history.find({"user":user}) if iso_to_dt(h.get("completed_at")) >= start]
-    fp = f"{REPORT_DIR}/monthly_{user}.pdf"
-    lines = []
-    for h in entries: lines.append(f"{h.get('date')} - {h.get('task')} ({h.get('duration')}m)")
-    create_pdf(fp, "Monthly Report", lines)
-    return fp
-
-@app.route("/download/<path:filename>")
-def download_report(filename):
-    fp = os.path.join(REPORT_DIR, filename)
-    if not os.path.exists(fp): return "Not found", 404
-    return send_file(fp, as_attachment=True)
-
-# ----------------- Suggestions -----------------
-def smart_suggestions(user):
-    history = list(col_history.find({"user": user}).sort("completed_at",-1).limit(200))
-    tasks = load_tasks_for_user(user)
-    s = load_user_stats(user)
-    out = []
-    now = datetime.now(LOCAL_TZ)
-    hour = now.hour
-    streak = s.get("current_streak",0)
-    if hour < 12:
-        out.append("Morning: try 25m focus.")
-    elif hour < 17:
-        out.append("Afternoon: try a 50m deep work.")
-    else:
-        out.append("Evening: keep it light — 15m review.")
-    if streak >= 5:
-        out.append(f"You are on a {streak}-day streak — keep going!")
-    if tasks:
-        out.append(f"Next task: {tasks[0]['task']} ({tasks[0]['duration']}m)")
-    # recommend frequent task
-    freq = {}
-    for h in history:
-        if h.get("type")=="pomodoro":
-            freq[h.get("task")] = freq.get(h.get("task"),0) + 1
-    if freq:
-        top = max(freq, key=freq.get)
-        out.append(f"You've done {top} often — continue it.")
-    if not out: out = ["Try a short 15-minute focus to start."]
-    return out
-
-# ----------------- Request routes -----------------
-@app.route("/", methods=["GET","HEAD"])
-def home(): return "OK", 200
+# ---------------------------
+# Main routes
+# ---------------------------
+@app.route("/", methods=["GET", "HEAD"])
+def home():
+    return "OK", 200
 
 @app.route("/pomodoro", methods=["POST"])
 def pomodoro_route():
@@ -600,198 +402,394 @@ def pomodoro_route():
     raw = (raw or "").strip()
     cmd = raw.lower()
 
-    # --- add task
+    # add task
     if cmd.startswith("add task"):
         parts = raw.split()
-        if len(parts) < 4: return jsonify({"reply":"Usage: add task <task name> <duration>"}), 200
+        if len(parts) < 4:
+            return jsonify({"reply": "Usage: add task <task name> <duration> (minutes)."})
         duration = parts[-1]
-        if not duration.isdigit(): return jsonify({"reply":"Duration must be a number"}),200
+        if not duration.isdigit():
+            return jsonify({"reply": "Duration must be a number (minutes)."})
         duration = int(duration)
-        name = " ".join(parts[2:-1])
-        q = load_tasks_for_user(user); q.append({"task":name,"duration":duration}); save_tasks_for_user(user,q)
-        return jsonify({"reply": f"📝 Added task: {name} ({duration} min)"}), 200
+        task_name = " ".join(parts[2:-1])
+        q = load_tasks_for_user(user)
+        q.append({"task": task_name, "duration": duration})
+        save_tasks_for_user(user, q)
+        return jsonify({"reply": f"📝 Added task: **{task_name}** ({duration} min)"})
 
-    # tasks
     if cmd == "tasks":
         q = load_tasks_for_user(user)
-        if not q: return jsonify({"reply":"📭 No tasks in queue."}),200
-        out = "📋 Task Queue:\n" + "\n".join([f"{i+1}. {t['task']} ({t['duration']}m)" for i,t in enumerate(q)])
-        # also send card
-        payload = build_task_queue_card(user)
-        send_zoho_message(text=payload["text"], card=payload.get("card"))
-        return jsonify({"reply": out}), 200
+        if not q:
+            return jsonify({"reply": "📭 No tasks in queue."})
+        out = "📋 Task Queue:\n"
+        for i, t in enumerate(q, start=1):
+            out += f"{i}. {t['task']} ({t['duration']} min)\n"
+        return jsonify({"reply": out})
 
-    # start next
     if cmd == "start next":
         q = load_tasks_for_user(user)
-        if not q: return jsonify({"reply":"No tasks in queue."}),200
-        next_task = q.pop(0); save_tasks_for_user(user,q)
-        duration = next_task["duration"]; task_name = next_task["task"]
+        if not q:
+            return jsonify({"reply": "📭 No tasks in the queue."})
+        next_task = q.pop(0)
+        save_tasks_for_user(user, q)
+        duration = next_task["duration"]
+        task_name = next_task["task"]
+        # cancel any break
         cur = get_active_timer(user)
-        if cur and cur.get("type")=="break": remove_active_timer(user)
-        schedule_timer(user,"pomodoro", duration, task_name)
-        payload = build_start_card(user, task_name, duration)
-        send_zoho_message(text=payload["text"], card=payload.get("card"), buttons=payload.get("buttons"))
-        return jsonify({"reply": f"Started next: {task_name} ({duration}m)"}),200
+        if cur and cur.get("type") == "break":
+            remove_active_timer(user)
+        schedule_timer(user, "pomodoro", duration, task_name)
+        send_zoho_message(f"🍅 Started **{task_name}** ({duration} min)")
+        return jsonify({"reply": f"▶️ Started next task: **{task_name}** ({duration} min)"})
 
-    # done n
     if cmd.startswith("done"):
         parts = cmd.split()
-        if len(parts)!=2 or not parts[1].isdigit(): return jsonify({"reply":"Usage: done <task_number>"}),200
-        idx = int(parts[1])-1
+        if len(parts) != 2 or not parts[1].isdigit():
+            return jsonify({"reply": "Usage: done <task_number>"})
+        idx = int(parts[1]) - 1
         q = load_tasks_for_user(user)
-        if idx<0 or idx>=len(q): return jsonify({"reply":"Invalid task number."}),200
-        removed = q.pop(idx); save_tasks_for_user(user,q)
-        return jsonify({"reply": f"Removed: {removed['task']}"}),200
+        if idx < 0 or idx >= len(q):
+            return jsonify({"reply": "❌ Invalid task number."})
+        removed = q.pop(idx)
+        save_tasks_for_user(user, q)
+        return jsonify({"reply": f"✔ Removed task: **{removed['task']}**"})
 
     if cmd == "clear tasks":
-        save_tasks_for_user(user, []); return jsonify({"reply":"Cleared all tasks."}),200
+        save_tasks_for_user(user, [])
+        return jsonify({"reply": "🗑 Cleared all tasks."})
 
-    # break <minutes> or break
     if cmd.startswith("break"):
         parts = raw.split()
-        minutes = 5
-        if len(parts)>=2 and parts[1].isdigit():
+        if len(parts) == 1:
+            minutes = 5
+        elif len(parts) == 2 and parts[1].isdigit():
             minutes = int(parts[1])
+        else:
+            return jsonify({"reply": "Usage: break OR break <minutes>"})
         cur = get_active_timer(user)
         paused = None
-        if cur and cur.get("type")=="pomodoro":
-            remaining = max(0, cur.get("ends_at",0) - now_ts())
-            paused = {"task":cur.get("task"), "remaining_seconds": remaining}
+        if cur and cur.get("type") == "pomodoro":
+            remaining = max(0, cur.get("ends_at", 0) - now_ts())
+            paused = {"task": cur.get("task"), "remaining_seconds": remaining}
             remove_active_timer(user)
         schedule_timer(user, "break", minutes, f"Manual Break ({minutes} min)", paused_pomodoro=paused)
-        payload = build_break_card(user, minutes, auto=False)
-        send_zoho_message(text=payload["text"], card=payload.get("card"), buttons=payload.get("buttons"))
-        return jsonify({"reply": f"Break started for {minutes} minutes."}),200
+        send_zoho_message(f"☕ Break started for {minutes} minutes.")
+        return jsonify({"reply": f"☕ Break started for {minutes} minutes."})
 
-    # stop break
-    if cmd in ("stop break","stopbreak","break stop"):
+    if cmd in ("stop break", "stopbreak", "break stop"):
         cur = get_active_timer(user)
-        if not cur or cur.get("type")!="break": return jsonify({"reply":"No active break."}),200
+        if not cur or cur.get("type") != "break":
+            return jsonify({"reply": "❌ No active break to stop."})
         paused = cur.get("paused_pomodoro")
         remove_active_timer(user)
         if paused:
-            remaining = int(paused.get("remaining_seconds",0))
+            remaining = int(paused.get("remaining_seconds", 0))
             schedule_timer(user, "pomodoro", remaining/60.0, paused.get("task"))
-            send_zoho_message(text=f"Resumed {paused.get('task')}", card=build_resume_card(user, paused))
-            return jsonify({"reply":"Break stopped. Resumed previous session."}),200
+            send_zoho_message(f"▶️ Resumed **{paused.get('task')}** with {remaining//60}m {remaining%60}s left.")
+            return jsonify({"reply": f"▶️ Break stopped. Resumed **{paused.get('task')}**."})
         else:
-            return jsonify({"reply":"Break stopped."}),200
+            return jsonify({"reply": "🛑 Break stopped."})
 
-    # start [<minutes>] [task name...]
     if cmd.startswith("start"):
         parts = raw.split()
         duration = 25
         task_name = "Untitled Task"
-        # cases:
-        # - "start 1" -> duration=1, task=Untitled
-        # - "start 1 homework" -> duration=1, task=homework
-        # - "start homework" -> task=homework, duration default 25
-        if len(parts) >= 2:
-            if parts[1].isdigit():
+        if len(parts) >= 2 and parts[0].lower() == "start":
+            if len(parts) >= 3 and parts[1].isdigit():
                 duration = int(parts[1])
-                if len(parts) >= 3:
-                    task_name = " ".join(parts[2:])
+                task_name = " ".join(parts[2:]) or "Untitled Task"
             else:
                 task_name = " ".join(parts[1:]) or "Untitled Task"
-        # cancel break if active
+        # cancel any break
         cur = get_active_timer(user)
-        if cur and cur.get("type")=="break": remove_active_timer(user)
+        if cur and cur.get("type") == "break":
+            remove_active_timer(user)
         schedule_timer(user, "pomodoro", duration, task_name)
-        payload = build_start_card(user, task_name, duration)
-        send_zoho_message(text=payload["text"], card=payload.get("card"), buttons=payload.get("buttons"))
-        return jsonify({"reply": f"Started {task_name} ({duration} min)"}),200
+        send_zoho_message(f"🍅 Started **{task_name}** ({duration} min)")
+        return jsonify({"reply": f"🍅 Started **{task_name}** ({duration} min)"})
 
-    # status/time/progress -> send card containing data
-    if cmd in ("status","time","progress"):
-        payload = build_status_card_payload(user)
-        send_zoho_message(text=payload["text"], card=payload.get("card"), buttons=payload.get("buttons"))
-        return jsonify({"reply":"Status card sent."}),200
+    if cmd in ("status", "time", "progress"):
+        cur = get_active_timer(user)
+        if not cur:
+            return jsonify({"reply": "❌ No active session."})
+        rem = max(0, cur.get("ends_at", 0) - now_ts())
+        typ = cur.get("type", "pomodoro")
+        if typ == "pomodoro":
+            return jsonify({"reply": f"🍅 {cur.get('task')} — {rem//60}m {rem%60}s left"})
+        else:
+            return jsonify({"reply": f"☕ Break — {rem//60}m {rem%60}s left"})
 
-    # stop / cancel / end
-    if cmd in ("stop","end","cancel"):
+    if cmd in ("stop", "end", "cancel"):
         cur = get_active_timer(user)
         if cur:
             remove_active_timer(user)
-            send_zoho_message(text="Session stopped.", card=build_simple_card("Stopped","Session stopped.", theme="danger"))
-            return jsonify({"reply":"Stopped."}),200
-        return jsonify({"reply":"No active session."}),200
+            return jsonify({"reply": "🛑 Stopped."})
+        return jsonify({"reply": "❌ No active session."})
 
-    # resume (if in break with paused pomodoro)
     if cmd == "resume":
         cur = get_active_timer(user)
-        if cur and cur.get("type")=="break" and cur.get("paused_pomodoro"):
+        if cur and cur.get("type") == "break" and cur.get("paused_pomodoro"):
             paused = cur.get("paused_pomodoro")
-            remaining = paused.get("remaining_seconds",0)
+            remaining = paused.get("remaining_seconds", 0)
             schedule_timer(user, "pomodoro", remaining/60.0, paused.get("task"))
-            payload = build_resume_card(user, paused)
-            send_zoho_message(text=payload["text"], card=payload.get("card"))
-            return jsonify({"reply":"Resumed."}),200
-        return jsonify({"reply":"Nothing to resume."}),200
+            send_zoho_message(f"⏯ Resumed **{paused.get('task')}**")
+            return jsonify({"reply": f"⏯ Resumed **{paused.get('task')}** with {remaining//60}m {remaining%60}s left."})
+        return jsonify({"reply": "❌ Nothing to resume."})
 
-    # today -> daily summary card
     if cmd == "today":
-        payload = build_daily_summary_card(user)
-        send_zoho_message(text=payload["text"], card=payload.get("card"))
-        return jsonify({"reply":"Daily summary sent."}),200
+        return jsonify({"reply": build_daily_summary(user)})
 
-    # week -> weekly analytics card
     if cmd == "week":
-        payload = build_weekly_analytics_card(user)
-        send_zoho_message(text=payload["text"], card=payload.get("card"))
-        return jsonify({"reply":"Weekly analytics sent."}),200
+        entries = list(col_history.find({"user": user}).sort("completed_at", -1).limit(21))
+        if not entries:
+            return jsonify({"reply": "📭 No history"})
+        summary = {}
+        for h in entries:
+            summary[h.get("date")] = summary.get(h.get("date"), 0) + 1
+        out = "📊 Weekly Summary\n"
+        for d, c in summary.items():
+            out += f"{d}: {'🍅'*c} ({c})\n"
+        return jsonify({"reply": out})
 
-    # chart / analytics -> same as weekly
-    if cmd in ("chart","analytics","weekly chart","weekly analytics"):
-        payload = build_weekly_analytics_card(user)
-        send_zoho_message(text=payload["text"], card=payload.get("card"))
-        return jsonify({"reply":"Analytics sent."}),200
+    if cmd in ("chart", "weekly chart", "analytics", "weekly analytics"):
+        return jsonify({"reply": get_weekly_chart(user)})
 
-    # streak -> score/streak
     if cmd == "streak":
         s = load_user_stats(user)
-        card = {"title":"Streaks","theme":"standard","sections":[{"widgets":[
-            {"type":"label","text":f"Current streak: {s.get('current_streak',0)} days"},
-            {"type":"label","text":f"Longest streak: {s.get('longest_streak',0)} days"}
-        ]}]}
-        send_zoho_message(text="Streak info", card=card)
-        return jsonify({"reply":"Streak sent."}),200
+        return jsonify({"reply": f"🔥 Streak: {s.get('current_streak', 0)} days\n🏆 Longest: {s.get('longest_streak', 0)} days"})
 
-    # score
     if cmd == "score":
-        payload = build_score_card(user)
-        send_zoho_message(text=payload["text"], card=payload.get("card"))
-        return jsonify({"reply":"Score sent."}),200
+        s = load_user_stats(user)
+        return jsonify({"reply": f"🎯 XP: {s.get('xp', 0)}\n⭐ Level: {s.get('level', 1)}"})
 
-    # export
     if cmd.startswith("export"):
-        if not REPORTLAB_AVAILABLE:
-            return jsonify({"reply":"Export not available (reportlab missing)."}),200
-        if cmd in ("export today","export daily"):
-            fp = generate_daily_report(user)
-        elif cmd in ("export week","export weekly"):
-            fp = generate_weekly_report(user)
-        elif cmd in ("export month","export monthly"):
-            fp = generate_monthly_report(user)
-        else:
-            return jsonify({"reply":"Use: export today|week|month"}),200
-        link = request.host_url.rstrip("/") + "/download/" + os.path.basename(fp)
-        send_zoho_message(text=f"Report ready: {link}")
-        return jsonify({"reply": f"Report: {link}"}),200
+        return handle_export_command(user, cmd)
 
-    # suggest
-    if cmd in ("suggest","ai suggest","suggestions"):
+    if cmd in ("suggest", "ai suggest", "suggestions"):
         items = smart_suggestions(user)
-        payload = build_suggestion_card(user, items)
-        send_zoho_message(text=payload["text"], card=payload.get("card"), buttons=payload.get("buttons"))
-        return jsonify({"reply":"Suggestions sent."}),200
+        reply = "🤖 *Here are some suggestions:* \n"
+        for i in items:
+            reply += f"• {i}\n"
+        return jsonify({"reply": reply})
 
-    # fallback - help
-    help_text = "Commands: start | break | stop break | resume | status | stop | today | week | chart | streak | score | add task | tasks | start next | done | clear tasks | export today | suggest"
-    return jsonify({"reply": help_text}), 200
+    # fallback
+    return jsonify({"reply": "Commands: start | break | stop break | resume | status | stop | today | week | chart | streak | score | add task | tasks | start next | done | clear tasks | export today | export week | export month | suggest"})
 
-# ----------------- Boot -----------------
+# ---------------------------
+# Export / PDF helpers (same as before)
+# ---------------------------
+def create_pdf(filepath, title, lines):
+    if not REPORTLAB_AVAILABLE:
+        raise RuntimeError("reportlab not installed")
+    c = canvas.Canvas(filepath, pagesize=A4)
+    width, height = A4
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(50, height - 80, title)
+    c.setFont("Helvetica", 12)
+    y = height - 120
+    for line in lines:
+        if y < 60:
+            c.showPage()
+            c.setFont("Helvetica", 12)
+            y = height - 60
+        c.drawString(50, y, line)
+        y -= 18
+    c.save()
+
+def generate_daily_report(user_id: str):
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    entries = list(col_history.find({"user": user_id, "date": today}))
+    filepath = os.path.join(REPORT_DIR, f"daily_{user_id}.pdf")
+    lines = []
+    total = 0
+    if not entries:
+        lines.append("No activity today.")
+    else:
+        lines.append("Today's Pomodoro Activity:\n")
+        for h in entries:
+            t = h.get("task", "")
+            d = h.get("duration", 0)
+            tt = h.get("type", "pomodoro")
+            lines.append(f"- {t} ({d} min, {tt})")
+            if tt == "pomodoro":
+                total += d
+        lines.append("")
+        lines.append(f"Total Focus Time: {total} min")
+    create_pdf(filepath, "Daily Report", lines)
+    return filepath
+
+def generate_weekly_report(user_id: str):
+    start = datetime.utcnow().replace(tzinfo=timezone.utc) - timedelta(days=7)
+    entries = [h for h in col_history.find({"user": user_id}) if iso_to_dt(h.get("completed_at")) >= start]
+    filepath = os.path.join(REPORT_DIR, f"weekly_{user_id}.pdf")
+    lines = []
+    total = 0
+    if not entries:
+        lines.append("No activity in last 7 days.")
+    else:
+        lines.append("Weekly Pomodoro Activity:\n")
+        for h in sorted(entries, key=lambda x: x.get("completed_at")):
+            lines.append(f"{h.get('date')}: {h.get('task')} ({h.get('duration')} min, {h.get('type')})")
+            if h.get("type") == "pomodoro":
+                total += int(h.get("duration", 0))
+        lines.append("")
+        lines.append(f"Total Focus Time (7 days): {total} min")
+    create_pdf(filepath, "Weekly Report", lines)
+    return filepath
+
+def generate_monthly_report(user_id: str):
+    start = datetime.utcnow().replace(tzinfo=timezone.utc) - timedelta(days=30)
+    entries = [h for h in col_history.find({"user": user_id}) if iso_to_dt(h.get("completed_at")) >= start]
+    filepath = os.path.join(REPORT_DIR, f"monthly_{user_id}.pdf")
+    lines = []
+    total = 0
+    p_count = 0
+    b_count = 0
+    if not entries:
+        lines.append("No activity in last 30 days.")
+    else:
+        lines.append("Monthly Pomodoro Activity:\n")
+        for h in sorted(entries, key=lambda x: x.get("completed_at")):
+            lines.append(f"{h.get('date')}: {h.get('task')} ({h.get('duration')} min, {h.get('type')})")
+            if h.get("type") == "pomodoro":
+                p_count += 1
+                total += int(h.get("duration", 0))
+            else:
+                b_count += 1
+        lines.append("")
+        lines.append(f"Pomodoro Sessions: {p_count}")
+        lines.append(f"Break Sessions: {b_count}")
+        lines.append(f"Total Focus Time: {total} min")
+    create_pdf(filepath, "Monthly Report", lines)
+    return filepath
+
+@app.route("/download/<path:filename>")
+def download_report(filename):
+    filepath = os.path.join(REPORT_DIR, filename)
+    if not os.path.exists(filepath):
+        return "❌ File not found.", 404
+    return send_file(filepath, as_attachment=True)
+
+def handle_export_command(user, raw_lower):
+    if not REPORTLAB_AVAILABLE:
+        return jsonify({"reply": "❌ PDF export not available (reportlab missing)."}), 500
+    if raw_lower in ("export today", "export daily"):
+        fp = generate_daily_report(user)
+    elif raw_lower in ("export week", "export weekly"):
+        fp = generate_weekly_report(user)
+    elif raw_lower in ("export month", "export monthly"):
+        fp = generate_monthly_report(user)
+    else:
+        return jsonify({"reply": "❌ Use: export today | export week | export month"})
+    link = request.host_url.rstrip("/") + "/download/" + os.path.basename(fp)
+    return jsonify({"reply": f"📄 Report ready! Download: {link}"})
+
+# ---------------------------
+# Analytics & suggestions (same as before)
+# ---------------------------
+def get_weekly_chart(user_id):
+    docs = list(col_history.find({"user": user_id}))
+    if not docs:
+        return "📭 No history available."
+    days = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+    weekly = {d: {"count":0, "minutes":0} for d in days}
+    for h in docs:
+        try:
+            dt = datetime.fromisoformat(h.get("completed_at"))
+        except:
+            try:
+                dt = datetime.strptime(h.get("date"), "%Y-%m-%d")
+            except:
+                dt = datetime.utcnow()
+        weekday = days[dt.weekday()]
+        weekly[weekday]["count"] += 1
+        weekly[weekday]["minutes"] += int(h.get("duration",0))
+    out = "📊 WEEKLY ANALYTICS\n\n"
+    total_sessions = 0
+    total_minutes = 0
+    most_day = None
+    most_count = 0
+    for day in days:
+        count = weekly[day]["count"]
+        minutes = weekly[day]["minutes"]
+        bar = ("█"*count) if count>0 else "-"
+        out += f"{day}: {bar} {count} ({minutes} min)\n"
+        total_sessions += count
+        total_minutes += minutes
+        if count > most_count:
+            most_count = count
+            most_day = day
+    out += f"\nTotal Sessions: {total_sessions}\nTotal Focus Time: {total_minutes} min\n"
+    if most_day:
+        out += f"🔥 Most productive day: {most_day} ({most_count} sessions)"
+    return out
+
+def build_daily_summary(user_id):
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    entries = list(col_history.find({"user": user_id, "date": today}))
+    if not entries:
+        return "📭 No activity today."
+    total = 0
+    completed_tasks = []
+    for h in entries:
+        completed_tasks.append(f"- {h.get('task')} ({h.get('duration')} min, {h.get('type')})")
+        if h.get("type") == "pomodoro":
+            total += int(h.get("duration",0))
+    s = f"📊 YOUR DAILY SUMMARY ({today})\n\nCompleted: {len(entries)} tasks\nTotal focus time: {total} min\n\nTasks:\n" + "\n".join(completed_tasks)
+    return s
+
+def smart_suggestions(user_id):
+    history = list(col_history.find({"user": user_id}).sort("completed_at", -1).limit(200))
+    tasks = load_tasks_for_user(user_id)
+    s = load_user_stats(user_id)
+    suggestions = []
+    now = datetime.now(LOCAL_TZ)
+    hour = now.hour
+    level = s.get("level",1)
+    streak = s.get("current_streak",0)
+    if hour < 12:
+        suggestions.append("A fresh morning — try a focused 25 min session.")
+    elif 12 <= hour < 17:
+        suggestions.append("Good afternoon! Deep work suits this slot.")
+    elif 17 <= hour < 21:
+        suggestions.append("Evening — prefer light review or creative tasks.")
+    else:
+        suggestions.append("It's late — plan tomorrow's tasks.")
+    if streak >= 5:
+        suggestions.append(f"You're on a {streak}-day streak — keep it up with a short session.")
+    elif 1 <= streak <= 4:
+        suggestions.append("You're building consistency — one Pomodoro will help.")
+    if level <= 3:
+        suggestions.append("Start with a 15–20 min session to earn XP quickly.")
+    elif level >= 8:
+        suggestions.append("Try a long deep-work 50–90 min block if possible.")
+    if history:
+        try:
+            last = datetime.fromisoformat(history[0].get("completed_at"))
+            idle_hours = (datetime.utcnow().replace(tzinfo=timezone.utc) - last).total_seconds() / 3600
+            if idle_hours >= 3:
+                suggestions.append("It's been a while — try a quick 10 min focus to restart.")
+        except:
+            pass
+    if tasks:
+        suggestions.append(f"Next task: **{tasks[0]['task']}** ({tasks[0]['duration']} min)")
+    freq = {}
+    for h in history:
+        if h.get("type") == "pomodoro":
+            t = h.get("task")
+            freq[t] = freq.get(t,0) + 1
+    if freq:
+        top = max(freq, key=freq.get)
+        suggestions.append(f"You've worked often on **{top}** — consider continuing it.")
+    if not suggestions:
+        suggestions = ["Try a small 15-minute session to start the streak."]
+    return suggestions
+
+# ---------------------------
+# Boot
+# ---------------------------
 if __name__ == "__main__":
-    print("Starting Pomodoro Bot with Card UI...")
+    print("Starting server-driven Pomodoro bot.")
     rehydrate_timers()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT",5000)))
+    # Run Flask
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
