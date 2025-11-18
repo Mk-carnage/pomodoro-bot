@@ -473,7 +473,8 @@ def pomodoro_route():
             paused = {"task": cur.get("task"), "remaining_seconds": remaining}
             remove_active_timer(user)
         schedule_timer(user, "break", minutes, f"Manual Break ({minutes} min)", paused_pomodoro=paused)
-        send_zoho_message(f"☕ Break started for {minutes} minutes.")
+        #send_zoho_message(f"☕ Break started for {minutes} minutes.")
+        return jsonify({"reply": f"☕ Break started for {minutes} minutes."})
         
 
     if cmd in ("stop break", "stopbreak", "break stop"):
@@ -525,7 +526,8 @@ def pomodoro_route():
 
     # Schedule the timer
     schedule_timer(user, "pomodoro", duration, task_name)
-    send_zoho_message(f"🍅 Started **{task_name}** ({duration} min)")
+    #send_zoho_message(f"🍅 Started **{task_name}** ({duration} min)")
+    return jsonify({"reply": f"🍅 Started **{task_name}** ({duration} min)"})
     
 
     if cmd in ("status", "time", "progress"):
