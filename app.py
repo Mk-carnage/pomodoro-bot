@@ -284,42 +284,35 @@ def refresh_access_token():
     return False
 
 
-def send_zoho_message(text: str = None, card: dict = None, buttons: list = None):
-    """Send Zoho message. Must include top-level 'text'. Optionally include 'card' and 'buttons'.
-    Follows Zoho v2 message format: https://www.zoho.com/cliq/help/restapi/v2/#Message
-    """
+def send_zoho_message(text=None, card=None, buttons=None):
     if not ZOHO_BOT_API:
-        print("ZOHO_BOT_API not configured; skipping send.")
+        print("ZOHO_BOT_API missing; skipping send.")
         return None
 
-    if not text and not card:
-        raise ValueError("send_zoho_message requires text or card")
+    headers = {
+        "Authorization": ZOHO_OAUTH_TOKEN,
+        "Content-Type": "application/json"
+    }
 
-    headers = {"Authorization": ZOHO_OAUTH_TOKEN, "Content-Type": "application/json"}
     payload = {}
-    # Zoho requires top-level 'text' key even when card present
-    payload["text"] = text or ""
+    if text:
+        payload["text"] = text
     if card:
         payload["card"] = card
     if buttons:
-        # top-level buttons array
         payload["buttons"] = buttons
 
-    # Debug
-    print("📨 PAYLOAD -> ZOHO:", json.dumps(payload))
+    print("📨 Sending to Zoho:", payload)
 
     try:
         r = requests.post(ZOHO_BOT_API, json=payload, headers=headers, timeout=10)
         if r.status_code == 401:
-            # try refresh once
             if refresh_access_token():
                 headers["Authorization"] = ZOHO_OAUTH_TOKEN
                 r = requests.post(ZOHO_BOT_API, json=payload, headers=headers, timeout=10)
-        print("Zoho send status:", getattr(r, "status_code", None), getattr(r, "text", None))
         return r
     except Exception as e:
-        print("send_zoho_message error:", e)
-        return None
+        print("Error sending Zoho message:", e)
 
 # ---------------------------
 # Card builders (Zoho v2 format)
@@ -357,22 +350,72 @@ def build_start_card(task: str, duration: int):
 
 def build_status_card(user: str):
     cur = get_active_timer(user)
+
+    # --- No active session ---
     if not cur:
-        card = {"title": "Status", "theme": "standard", "sections": [{"widgets": [{"type": "label", "text": "No active session."}]}]}
-        return card, None
-    rem = max(0, cur.get("ends_at", 0) - now_ts())
+        return {
+            "text": "❌ No active session.",
+            "card": {
+                "title": "Pomodoro Status",
+                "theme": "default",
+                "thumbnail": "https://img.icons8.com/color/96/tomato.png",
+                "sections": [
+                    {
+                        "widgets": [
+                            { "type": "label", "text": "There is no active Pomodoro or break running." }
+                        ]
+                    }
+                ]
+            },
+            "buttons": []
+        }
+
+    # --- Active session ---
+    rem = max(0, cur["ends_at"] - now_ts())
+    m, s = rem // 60, rem % 60
+    task = cur.get("task", "Untitled")
     typ = cur.get("type", "pomodoro")
-    lines = [f"Task: {cur.get('task')}", f"Type: {typ}", f"Remaining: {rem//60}m {rem%60}s"]
-    card = {
-        "title": "Session Status",
-        "theme": "standard",
-        "sections": [{"widgets": [{"type": "label", "text": l} for l in lines]}]
+
+    if typ == "pomodoro":
+        status_line = f"🍅 {task} — {m}m {s}s left"
+    else:
+        status_line = f"☕ Break — {m}m {s}s left"
+
+    return {
+        "text": status_line,
+        "card": {
+            "title": "Session Status",
+            "theme": "default",
+            "thumbnail": "https://img.icons8.com/color/96/tomato.png",
+            "sections": [
+                {
+                    "widgets": [
+                        { "type": "label", "text": f"Task : {task}" },
+                        { "type": "label", "text": f"Type : {typ}" },
+                        { "type": "label", "text": f"Remaining : {m}m {s}s" }
+                    ]
+                }
+            ]
+        },
+        "buttons": [
+            {
+                "label": "Stop",
+                "type": "-",
+                "action": {
+                    "type": "invoke.function",
+                    "data": { "cmd": "stop" }
+                }
+            },
+            {
+                "label": "Break",
+                "type": "+",
+                "action": {
+                    "type": "invoke.function",
+                    "data": { "cmd": "break" }
+                }
+            }
+        ]
     }
-    buttons = [
-        {"label": "Stop", "type": "-", "action": {"type": "invoke.function", "data": {"name": "stop_cmd"}}},
-        {"label": "Break", "type": "+", "action": {"type": "invoke.function", "data": {"name": "break_cmd"}}}
-    ]
-    return card, buttons
 
 
 def build_summary_card(user: str):
@@ -729,9 +772,16 @@ def pomodoro_route():
         return jsonify({"reply": f"🍅 Started **{task_name}** ({duration} min)"}), 200
 
     if cmd in ("status", "time", "progress"):
-        card, buttons = build_status_card(user)
-        send_zoho_message(text="Session status", card=card, buttons=None)
-        return jsonify({"reply": "Status sent."}), 200
+    card_payload = build_status_card(user)   # returns full JSON: { text, card, buttons }
+
+    # Send card to Cliq
+    send_zoho_message(
+        text=card_payload["text"],
+        card=card_payload.get("card"),
+        buttons=card_payload.get("buttons")
+    )
+
+    return jsonify({"reply": "Status card sent."}), 200
 
     if cmd in ("stop", "end", "cancel"):
         cur = get_active_timer(user)
