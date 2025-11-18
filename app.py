@@ -474,7 +474,7 @@ def pomodoro_route():
             remove_active_timer(user)
         schedule_timer(user, "break", minutes, f"Manual Break ({minutes} min)", paused_pomodoro=paused)
         send_zoho_message(f"☕ Break started for {minutes} minutes.")
-        return jsonify({"reply": f"☕ Break started for {minutes} minutes."})
+        
 
     if cmd in ("stop break", "stopbreak", "break stop"):
         cur = get_active_timer(user)
@@ -491,22 +491,42 @@ def pomodoro_route():
             return jsonify({"reply": "🛑 Break stopped."})
 
     if cmd.startswith("start"):
-        parts = raw.split()
-        duration = 25
+    parts = raw.split()
+
+    # Default values
+    duration = 25
+    task_name = "Untitled Task"
+
+    # Case A: start <duration>
+    # Example: start 15
+    if len(parts) == 2 and parts[1].isdigit():
+        duration = int(parts[1])
         task_name = "Untitled Task"
-        if len(parts) >= 2 and parts[0].lower() == "start":
-            if len(parts) >= 3 and parts[1].isdigit():
-                duration = int(parts[1])
-                task_name = " ".join(parts[2:]) or "Untitled Task"
-            else:
-                task_name = " ".join(parts[1:]) or "Untitled Task"
-        # cancel any break
-        cur = get_active_timer(user)
-        if cur and cur.get("type") == "break":
-            remove_active_timer(user)
-        schedule_timer(user, "pomodoro", duration, task_name)
-        send_zoho_message(f"🍅 Started **{task_name}** ({duration} min)")
-        return jsonify({"reply": f"🍅 Started **{task_name}** ({duration} min)"})
+
+    # Case B: start <taskName> <duration>
+    # Example: start write report 15
+    elif len(parts) >= 3 and parts[-1].isdigit():
+        duration = int(parts[-1])
+        task_name = " ".join(parts[1:-1])
+
+    # Case C: start <taskName>
+    # Example: start research
+    elif len(parts) >= 2:
+        task_name = " ".join(parts[1:])
+
+    # Cleanup / Safety
+    if not task_name.strip():
+        task_name = "Untitled Task"
+
+    # Cancel any active break
+    cur = get_active_timer(user)
+    if cur and cur.get("type") == "break":
+        remove_active_timer(user)
+
+    # Schedule the timer
+    schedule_timer(user, "pomodoro", duration, task_name)
+    send_zoho_message(f"🍅 Started **{task_name}** ({duration} min)")
+    
 
     if cmd in ("status", "time", "progress"):
         cur = get_active_timer(user)
