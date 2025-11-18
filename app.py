@@ -278,13 +278,19 @@ def _timer_worker(user: str):
                 gained, total_xp, level = update_score(user, int(t.get("duration", 25)), current_streak)
 
                 # notify completion
-               
+                send_zoho_message(
+                    f"⏰ Pomodoro completed!\n✔ Task: **{hist_item['task']}** ({hist_item['duration']} min)\n\n"
+                    f"🔥 Streak: {current_streak} days\n🏆 Longest streak: {longest} days\n\n"
+                    f"🎯 XP earned: +{gained}\n💠 Total XP: {total_xp}\n⭐ Level: {level}"
+                )
+
                 # auto-start break
                 completed_today = count_pomodoros_today(user)
                 auto_break_min = 15 if (completed_today % 4 == 0) else 5
                 break_ends_at = now_ts() + auto_break_min * 60
                 set_active_timer(user, {"type": "break", "ends_at": break_ends_at, "task": f"Auto Break ({auto_break_min} min)", "duration": auto_break_min})
-                
+                send_zoho_message(f"☕ Auto-break started for {auto_break_min} minutes. (Type `stop break` to cancel.)")
+
                 # loop to continue worker for break
                 continue
 
@@ -306,15 +312,15 @@ def _timer_worker(user: str):
                     remaining = int(paused.get("remaining_seconds", 0))
                     ends_at = now_ts() + remaining
                     set_active_timer(user, {"type": "pomodoro", "ends_at": ends_at, "task": paused.get("task"), "duration": round(remaining/60, 2)})
-                   
+                    send_zoho_message(f"⏰ Break over — resuming **{paused.get('task')}** with {remaining//60}m {remaining%60}s left.")
                     continue
                 else:
                     remove_active_timer(user)
-                    
+                    send_zoho_message("☕ Break over! Ready to get back to work.")
                     q = load_tasks_for_user(user)
                     if q:
                         next_task = q[0]
-                        
+                        send_zoho_message(f"⏭ Next task in queue: **{next_task['task']}** ({next_task['duration']} min). Type `start next` to continue.")
                     break
 
             else:
@@ -433,7 +439,7 @@ def pomodoro_route():
         if cur and cur.get("type") == "break":
             remove_active_timer(user)
         schedule_timer(user, "pomodoro", duration, task_name)
-        
+        send_zoho_message(f"🍅 Started **{task_name}** ({duration} min)")
         return jsonify({"reply": f"▶️ Started next task: **{task_name}** ({duration} min)"})
 
     if cmd.startswith("done"):
@@ -467,7 +473,7 @@ def pomodoro_route():
             paused = {"task": cur.get("task"), "remaining_seconds": remaining}
             remove_active_timer(user)
         schedule_timer(user, "break", minutes, f"Manual Break ({minutes} min)", paused_pomodoro=paused)
-        
+        send_zoho_message(f"☕ Break started for {minutes} minutes.")
         return jsonify({"reply": f"☕ Break started for {minutes} minutes."})
 
     if cmd in ("stop break", "stopbreak", "break stop"):
@@ -479,7 +485,7 @@ def pomodoro_route():
         if paused:
             remaining = int(paused.get("remaining_seconds", 0))
             schedule_timer(user, "pomodoro", remaining/60.0, paused.get("task"))
-            
+            send_zoho_message(f"▶️ Resumed **{paused.get('task')}** with {remaining//60}m {remaining%60}s left.")
             return jsonify({"reply": f"▶️ Break stopped. Resumed **{paused.get('task')}**."})
         else:
             return jsonify({"reply": "🛑 Break stopped."})
@@ -499,7 +505,7 @@ def pomodoro_route():
         if cur and cur.get("type") == "break":
             remove_active_timer(user)
         schedule_timer(user, "pomodoro", duration, task_name)
-        
+        send_zoho_message(f"🍅 Started **{task_name}** ({duration} min)")
         return jsonify({"reply": f"🍅 Started **{task_name}** ({duration} min)"})
 
     if cmd in ("status", "time", "progress"):
@@ -526,7 +532,7 @@ def pomodoro_route():
             paused = cur.get("paused_pomodoro")
             remaining = paused.get("remaining_seconds", 0)
             schedule_timer(user, "pomodoro", remaining/60.0, paused.get("task"))
-           
+            send_zoho_message(f"⏯ Resumed **{paused.get('task')}**")
             return jsonify({"reply": f"⏯ Resumed **{paused.get('task')}** with {remaining//60}m {remaining%60}s left."})
         return jsonify({"reply": "❌ Nothing to resume."})
 
