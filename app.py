@@ -199,6 +199,45 @@ def send_zoho_message(text: str, user_hint: str = None):
         print("send_zoho_message error:", e)
         return None
 
+
+
+# Real AI code 
+
+HF_TOKEN = os.getenv("HF_TOKEN")
+MODEL_ID = os.getenv("HF_MODEL_ID", "meta-llama/Meta-Llama-3-8B-Instruct")
+
+def hf_ai_suggestions(user_id):
+    history = list(col_history.find({"user": user_id}).sort("completed_at", -1).limit(50))
+    tasks = load_tasks_for_user(user_id)
+    stats = load_user_stats(user_id)
+
+    hist_text = "\n".join(f"{h.get('date')} – {h.get('task')} ({h.get('duration')} min)" for h in history)
+    task_text = "\n".join(f"{t['task']} ({t['duration']} min)" for t in tasks)
+
+    prompt = (
+        f"You are a productivity assistant.\n\n"
+        f"User history:\n{hist_text or 'No history'}\n\n"
+        f"Pending tasks:\n{task_text or 'No tasks'}\n\n"
+        f"Stats: XP={stats.get('xp')} Level={stats.get('level')} Streak={stats.get('current_streak')}\n\n"
+        "Give 5 short actionable suggestions to help the user be productive now."
+    )
+
+    api_url = f"https://api-inference.huggingface.co/models/{MODEL_ID}"
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    payload = {"inputs": prompt, "parameters": {"max_new_tokens": 150}}
+
+    resp = requests.post(api_url, headers=headers, json=payload, timeout=60)
+    j = resp.json()
+
+    suggestion_text = (
+        j.get("generated_text")
+        or (j[0].get("generated_text") if isinstance(j, list) else None)
+        or j.get("choices", [{}])[0].get("text")
+        or str(j)
+    )
+
+    return suggestion_text.strip()
+
 # ---------------------------
 # Scoring / streaks
 # ---------------------------
@@ -578,11 +617,8 @@ def pomodoro_route():
         return handle_export_command(user, cmd)
 
     if cmd in ("suggest", "ai suggest", "suggestions"):
-        items = smart_suggestions(user)
-        reply = "🤖 *Here are some suggestions:* \n"
-        for i in items:
-            reply += f"• {i}\n"
-        return jsonify({"reply": reply})
+        reply = hf_ai_suggestions(user)
+        return jsonify({"reply": "🤖 *AI Suggestions:*\n" + reply})
 
     # fallback
     return jsonify({"reply": "Commands: start | break | stop break | resume | status | stop | today | week | chart | streak | score | add task | tasks | start next | done | clear tasks | export today | export week | export month | suggest"})
@@ -750,52 +786,7 @@ def build_daily_summary(user_id):
     s = f"📊 YOUR DAILY SUMMARY ({today})\n\nCompleted: {len(entries)} tasks\nTotal focus time: {total} min\n\nTasks:\n" + "\n".join(completed_tasks)
     return s
 
-def smart_suggestions(user_id):
-    history = list(col_history.find({"user": user_id}).sort("completed_at", -1).limit(200))
-    tasks = load_tasks_for_user(user_id)
-    s = load_user_stats(user_id)
-    suggestions = []
-    now = datetime.now(LOCAL_TZ)
-    hour = now.hour
-    level = s.get("level",1)
-    streak = s.get("current_streak",0)
-    if hour < 12:
-        suggestions.append("A fresh morning — try a focused 25 min session.")
-    elif 12 <= hour < 17:
-        suggestions.append("Good afternoon! Deep work suits this slot.")
-    elif 17 <= hour < 21:
-        suggestions.append("Evening — prefer light review or creative tasks.")
-    else:
-        suggestions.append("It's late — plan tomorrow's tasks.")
-    if streak >= 5:
-        suggestions.append(f"You're on a {streak}-day streak — keep it up with a short session.")
-    elif 1 <= streak <= 4:
-        suggestions.append("You're building consistency — one Pomodoro will help.")
-    if level <= 3:
-        suggestions.append("Start with a 15–20 min session to earn XP quickly.")
-    elif level >= 8:
-        suggestions.append("Try a long deep-work 50–90 min block if possible.")
-    if history:
-        try:
-            last = datetime.fromisoformat(history[0].get("completed_at"))
-            idle_hours = (datetime.utcnow().replace(tzinfo=timezone.utc) - last).total_seconds() / 3600
-            if idle_hours >= 3:
-                suggestions.append("It's been a while — try a quick 10 min focus to restart.")
-        except:
-            pass
-    if tasks:
-        suggestions.append(f"Next task: **{tasks[0]['task']}** ({tasks[0]['duration']} min)")
-    freq = {}
-    for h in history:
-        if h.get("type") == "pomodoro":
-            t = h.get("task")
-            freq[t] = freq.get(t,0) + 1
-    if freq:
-        top = max(freq, key=freq.get)
-        suggestions.append(f"You've worked often on **{top}** — consider continuing it.")
-    if not suggestions:
-        suggestions = ["Try a small 15-minute session to start the streak."]
-    return suggestions
+
 
 # ---------------------------
 # Boot
