@@ -212,59 +212,50 @@ def hf_ai_suggestions(user_id):
     tasks = load_tasks_for_user(user_id)
     stats = load_user_stats(user_id)
 
-    hist_text = "\n".join(
-        f"{h.get('date')} – {h.get('task')} ({h.get('duration')} min)" 
-        for h in history
+    hist_text = "\n".join(f"{h.get('date')} – {h.get('task')} ({h.get('duration')} min)" for h in history)
+    task_text = "\n".join(f"{t['task']} ({t['duration']} min)" for t in tasks)
+
+    prompt = (
+        f"You are a productivity assistant.\n\n"
+        f"User history:\n{hist_text or 'No history'}\n\n"
+        f"Pending tasks:\n{task_text or 'No tasks'}\n\n"
+        f"Stats: XP={stats.get('xp')} Level={stats.get('level')} Streak={stats.get('current_streak')}\n\n"
+        "Give 5 short actionable productivity suggestions."
     )
-    task_text = "\n".join(
-        f"{t['task']} ({t['duration']} min)" 
-        for t in tasks
-    )
 
-    prompt = f"""
-You are a productivity assistant bot.
+    api_url = "https://router.huggingface.co/inference"
 
-User History:
-{hist_text or 'No history'}
-
-Pending Tasks:
-{task_text or 'No tasks'}
-
-Stats:
-XP: {stats.get('xp')}
-Level: {stats.get('level')}
-Streak: {stats.get('current_streak')}
-
-Give 5 short actionable productivity suggestions.
-"""
-
-    api_url = f"https://router.huggingface.co/{MODEL_ID}"
     headers = {
         "Authorization": f"Bearer {HF_TOKEN}",
         "Content-Type": "application/json"
     }
+
     payload = {
-        "inputs": prompt,
+        "model": MODEL_ID,    # <--- IMPORTANT
+        "input": prompt,
         "parameters": {
             "max_new_tokens": 150,
             "temperature": 0.7
         }
     }
-    resp = requests.post(api_url, headers=headers, json=payload, timeout=40)
-    
+
+    resp = requests.post(api_url, headers=headers, json=payload)
+
+    # Attempt JSON parsing
     try:
         data = resp.json()
-    except:
+    except Exception:
         print("HF RAW RESPONSE:", resp.text)
         return "⚠️ AI returned invalid response. Check model or token."
-    
-    # Working for HF free models
-    if isinstance(data, list) and len(data) and "generated_text" in data[0]:
-        return data[0]["generated_text"].strip()
-    
+
+    # Valid router response
+    if "generated_text" in data:
+        return data["generated_text"]
+
+    # OpenAI-style format
     if "choices" in data:
         return data["choices"][0].get("text", "").strip()
-    
+
     return str(data)
 
 # ---------------------------
