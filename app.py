@@ -204,10 +204,13 @@ def send_zoho_message(text: str, user_hint: str = None):
 # Real AI code 
 
 
+
+
 HF_TOKEN = os.getenv("HF_TOKEN")
-MODEL_ID = os.getenv("HF_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
+HF_MODEL = "meta-llama/Llama-3.1-8B-Instruct:novita"   # Use the exact model from your example
 
 def hf_ai_suggestions(user_id):
+    # Collect past data
     history = list(col_history.find({"user": user_id}).sort("completed_at", -1).limit(50))
     tasks = load_tasks_for_user(user_id)
     stats = load_user_stats(user_id)
@@ -215,16 +218,24 @@ def hf_ai_suggestions(user_id):
     hist_text = "\n".join(f"{h.get('date')} – {h.get('task')} ({h.get('duration')} min)" for h in history)
     task_text = "\n".join(f"{t['task']} ({t['duration']} min)" for t in tasks)
 
-    prompt = (
-        f"You are a productivity assistant.\n\n"
-        f"User history:\n{hist_text or 'No history'}\n\n"
-        f"Pending tasks:\n{task_text or 'No tasks'}\n\n"
-        f"Stats: XP={stats.get('xp')} Level={stats.get('level')} Streak={stats.get('current_streak')}\n\n"
-        "Give 5 short actionable productivity suggestions."
-    )
+    prompt = f"""
+You are a productivity coach AI.
 
-    # NEW HUGGINGFACE ENDPOINT (avoid 404 + avoid deprecated api)
-    api_url = f"https://router.huggingface.co/{MODEL_ID}"
+User history:
+{hist_text or "No history"}
+
+Pending tasks:
+{task_text or "No tasks"}
+
+Stats:
+XP={stats.get('xp')}
+Level={stats.get('level')}
+Streak={stats.get('current_streak')}
+
+Give exactly 5 short practical suggestions the user can do right now.
+"""
+
+    url = "https://router.huggingface.co/v1/chat/completions"
 
     headers = {
         "Authorization": f"Bearer {HF_TOKEN}",
@@ -232,31 +243,29 @@ def hf_ai_suggestions(user_id):
     }
 
     payload = {
-        "inputs": prompt,
-        "parameters": {"max_new_tokens": 150, "temperature": 0.8}
+        "model": HF_MODEL,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 180,
+        "temperature": 0.7
     }
 
-    resp = requests.post(api_url, headers=headers, json=payload, timeout=30)
+    resp = requests.post(url, json=payload, headers=headers)
 
-    # Log raw output
-    print("HF RAW RESPONSE:", resp.text)
-
+    # Debug fallback
     try:
-        j = resp.json()
+        data = resp.json()
     except:
-        return "⚠️ Unable to decode AI response. Check model/token."
+        print("HF RAW RESPONSE:", resp.text)
+        return "⚠️ AI returned invalid response."
 
-    # New router format
-    if "generated_text" in j:
-        return j["generated_text"].strip()
-
-    if isinstance(j, list) and "generated_text" in j[0]:
-        return j[0]["generated_text"].strip()
-
-    if "error" in j:
-        return f"⚠️ HuggingFace Error: {j['error']}"
-
-    return str(j)
+    # Extract AI text
+    try:
+        return data["choices"][0]["message"]["content"].strip()
+    except:
+        print("HF PARSE ERROR:", data)
+        return "⚠️ Could not parse AI response."
 # ---------------------------
 # Scoring / streaks
 # ---------------------------
