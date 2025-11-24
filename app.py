@@ -243,37 +243,29 @@ Give 5 short actionable productivity suggestions.
         "Authorization": f"Bearer {HF_TOKEN}",
         "Content-Type": "application/json"
     }
-
     payload = {
         "inputs": prompt,
         "parameters": {
-            "max_new_tokens": 200,
+            "max_new_tokens": 150,
             "temperature": 0.7
         }
     }
-
+    resp = requests.post(api_url, headers=headers, json=payload, timeout=40)
+    
     try:
-        resp = requests.post(api_url, headers=headers, json=payload, timeout=40)
+        data = resp.json()
+    except:
         print("HF RAW RESPONSE:", resp.text)
-
-        try:
-            data = resp.json()
-        except:
-            return "⚠️ AI returned invalid response. Check model or token."
-
-        # Mistral returns list → {"generated_text": "...."}
-        if isinstance(data, list) and len(data) and "generated_text" in data[0]:
-            return data[0]["generated_text"].strip()
-
-        # OpenChat / Qwen style → dict → {"choices":[{"text":""}]}
-        if "choices" in data:
-            return data["choices"][0].get("text", "").strip()
-
-        return str(data)
-
-    except Exception as e:
-        print("HF ERROR:", e)
-        return "⚠️ AI suggestion service temporarily unavailable."
+        return "⚠️ AI returned invalid response. Check model or token."
+    
+    # Working for HF free models
+    if isinstance(data, list) and len(data) and "generated_text" in data[0]:
+        return data[0]["generated_text"].strip()
+    
+    if "choices" in data:
+        return data["choices"][0].get("text", "").strip()
+    
+    return str(data)
 
 # ---------------------------
 # Scoring / streaks
