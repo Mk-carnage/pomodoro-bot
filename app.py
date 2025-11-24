@@ -203,40 +203,77 @@ def send_zoho_message(text: str, user_hint: str = None):
 
 # Real AI code 
 
+
 HF_TOKEN = os.getenv("HF_TOKEN")
-MODEL_ID = os.getenv("HF_MODEL_ID", "meta-llama/Meta-Llama-3-8B-Instruct")
+MODEL_ID = os.getenv("HF_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
 
 def hf_ai_suggestions(user_id):
     history = list(col_history.find({"user": user_id}).sort("completed_at", -1).limit(50))
     tasks = load_tasks_for_user(user_id)
     stats = load_user_stats(user_id)
 
-    hist_text = "\n".join(f"{h.get('date')} – {h.get('task')} ({h.get('duration')} min)" for h in history)
-    task_text = "\n".join(f"{t['task']} ({t['duration']} min)" for t in tasks)
-
-    prompt = (
-        f"You are a productivity assistant.\n\n"
-        f"User history:\n{hist_text or 'No history'}\n\n"
-        f"Pending tasks:\n{task_text or 'No tasks'}\n\n"
-        f"Stats: XP={stats.get('xp')} Level={stats.get('level')} Streak={stats.get('current_streak')}\n\n"
-        "Give 5 short actionable suggestions to help the user be productive now."
+    hist_text = "\n".join(
+        f"{h.get('date')} – {h.get('task')} ({h.get('duration')} min)" 
+        for h in history
+    )
+    task_text = "\n".join(
+        f"{t['task']} ({t['duration']} min)" 
+        for t in tasks
     )
 
-    api_url = f"https://router.huggingface.co/models/{MODEL_ID}"
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    payload = {"inputs": prompt, "parameters": {"max_new_tokens": 150}}
+    prompt = f"""
+You are a productivity assistant bot.
 
-    resp = requests.post(api_url, headers=headers, json=payload, timeout=60)
-    j = resp.json()
+User History:
+{hist_text or 'No history'}
 
-    suggestion_text = (
-        j.get("generated_text")
-        or (j[0].get("generated_text") if isinstance(j, list) else None)
-        or j.get("choices", [{}])[0].get("text")
-        or str(j)
-    )
+Pending Tasks:
+{task_text or 'No tasks'}
 
-    return suggestion_text.strip()
+Stats:
+XP: {stats.get('xp')}
+Level: {stats.get('level')}
+Streak: {stats.get('current_streak')}
+
+Give 5 short actionable productivity suggestions.
+"""
+
+    api_url = f"https://router.huggingface.co/{MODEL_ID}"
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "max_new_tokens": 200,
+            "temperature": 0.7
+        }
+    }
+
+    try:
+        resp = requests.post(api_url, headers=headers, json=payload, timeout=40)
+        print("HF RAW RESPONSE:", resp.text)
+
+        try:
+            data = resp.json()
+        except:
+            return "⚠️ AI returned invalid response. Check model or token."
+
+        # Mistral returns list → {"generated_text": "...."}
+        if isinstance(data, list) and len(data) and "generated_text" in data[0]:
+            return data[0]["generated_text"].strip()
+
+        # OpenChat / Qwen style → dict → {"choices":[{"text":""}]}
+        if "choices" in data:
+            return data["choices"][0].get("text", "").strip()
+
+        return str(data)
+
+    except Exception as e:
+        print("HF ERROR:", e)
+        return "⚠️ AI suggestion service temporarily unavailable."
 
 # ---------------------------
 # Scoring / streaks
