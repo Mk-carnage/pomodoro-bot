@@ -223,7 +223,8 @@ def hf_ai_suggestions(user_id):
         "Give 5 short actionable productivity suggestions."
     )
 
-    api_url = "https://router.huggingface.co/inference"
+    # NEW HUGGINGFACE ENDPOINT (avoid 404 + avoid deprecated api)
+    api_url = f"https://router.huggingface.co/{MODEL_ID}"
 
     headers = {
         "Authorization": f"Bearer {HF_TOKEN}",
@@ -231,33 +232,31 @@ def hf_ai_suggestions(user_id):
     }
 
     payload = {
-        "model": MODEL_ID,    # <--- IMPORTANT
-        "input": prompt,
-        "parameters": {
-            "max_new_tokens": 150,
-            "temperature": 0.7
-        }
+        "inputs": prompt,
+        "parameters": {"max_new_tokens": 150, "temperature": 0.8}
     }
 
-    resp = requests.post(api_url, headers=headers, json=payload)
+    resp = requests.post(api_url, headers=headers, json=payload, timeout=30)
 
-    # Attempt JSON parsing
+    # Log raw output
+    print("HF RAW RESPONSE:", resp.text)
+
     try:
-        data = resp.json()
-    except Exception:
-        print("HF RAW RESPONSE:", resp.text)
-        return "⚠️ AI returned invalid response. Check model or token."
+        j = resp.json()
+    except:
+        return "⚠️ Unable to decode AI response. Check model/token."
 
-    # Valid router response
-    if "generated_text" in data:
-        return data["generated_text"]
+    # New router format
+    if "generated_text" in j:
+        return j["generated_text"].strip()
 
-    # OpenAI-style format
-    if "choices" in data:
-        return data["choices"][0].get("text", "").strip()
+    if isinstance(j, list) and "generated_text" in j[0]:
+        return j[0]["generated_text"].strip()
 
-    return str(data)
+    if "error" in j:
+        return f"⚠️ HuggingFace Error: {j['error']}"
 
+    return str(j)
 # ---------------------------
 # Scoring / streaks
 # ---------------------------
