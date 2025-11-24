@@ -222,7 +222,7 @@ def hf_ai_suggestions(user_id):
         "Give 5 short actionable suggestions to help the user be productive now."
     )
 
-    api_url = f"https://api-inference.huggingface.co/models/{MODEL_ID}"
+    api_url = f"https://router.huggingface.co/models/{MODEL_ID}"
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
     payload = {"inputs": prompt, "parameters": {"max_new_tokens": 150}}
 
